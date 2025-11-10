@@ -1,0 +1,21 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "2.3.1"
+torchaudio = "2.3.1"
+matplotlib = "*"
+pywhispercpp = "*"
+transformers = ">=4.39"
+"huggingface-hub" = ">=0.34,<1.0"
+"pyannote.audio" = "*"
+ollama = "*"
+pydub = "*"
+spacy = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
