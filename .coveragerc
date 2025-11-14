@@ -1,6 +1,5 @@
 [run]
 omit =
-    mywhisper/myw/*
     mywhisper/myw.py
     mywhisper/config.py
     mywhisper/myw/logging.py
