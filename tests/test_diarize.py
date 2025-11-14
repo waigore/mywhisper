@@ -68,6 +68,7 @@ def test_chunk_scheduler_creates_chunks(tmp_path, monkeypatch):
         show_title="Test Show",
         episode_title="Sample Episode",
         source_path=Path("audio.wav"),
+        metadata={"episode_key": "45678901"},
     )
 
     waveform = torch.arange(0, 320, dtype=torch.float32).view(1, -1)
@@ -84,7 +85,7 @@ def test_chunk_scheduler_creates_chunks(tmp_path, monkeypatch):
 
     monkeypatch.setattr("mywhisper.diarize.sf.write", fake_write)
 
-    chunks = list(scheduler.schedule(podcast, artefact_key="ABC12345"))
+    chunks = list(scheduler.schedule(podcast, podcast.episode_key))
     assert len(chunks) >= 1
     assert writes
 

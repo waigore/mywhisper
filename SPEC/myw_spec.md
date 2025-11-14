@@ -108,11 +108,12 @@ mywhisper/myw/
   - Podcast title, Episode title, Description (render `N/A` when unavailable), File size, Duration, Download path, Current status.
   - If transcription artifacts exist, show summary (transcript path, diarization status).
 - Commands:
+  - `(b)` returns to `PodcastListingScreen`, preserving the prior table selection.
   - `(e)` / `enter` triggers `QueueController.enqueue(episode_id)`.
   - If queue empty and pipeline idle, enqueue starts pipeline immediately.
   - Provide confirmation toast/message to user.
 - Navigation:
-  - Use default Textual `Screen` navigation (escape/`ctrl+q`) to go back.
+  - Support explicit `(b)` back navigation alongside default Textual shortcuts (escape/`ctrl+q`).
   - Breadcrumb header showing `Listing > Episode`.
 
 ## Queue & Pipeline Processing

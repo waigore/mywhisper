@@ -22,6 +22,7 @@ class PodcastViewScreen(Screen):
     """
 
     BINDINGS = [
+        Binding("b", "back", "Back", show=True),
         Binding("e", "enqueue", "Enqueue", show=True),
     ]
 
@@ -46,6 +47,10 @@ class PodcastViewScreen(Screen):
     async def action_enqueue(self) -> None:
         self._enqueue_callback(self.episode.episode_id)
         LOGGER.info("Episode %s enqueued from view screen", self.episode.episode_id)
+        await self.app.pop_screen()
+
+    async def action_back(self) -> None:
+        LOGGER.info("Returning to listing from view screen for episode %s", self.episode.episode_id)
         await self.app.pop_screen()
 
     def _render_detail(self) -> None:

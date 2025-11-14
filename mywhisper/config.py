@@ -42,6 +42,21 @@ def generate_artefact_key() -> str:
     return secrets.token_hex(4).upper()
 
 
+def derive_episode_key(episode_id: str) -> str:
+    """
+    Derive a deterministic eight-digit episode key from an identifier.
+    """
+
+    if not episode_id:
+        raise ValueError("episode_id must be a non-empty string.")
+
+    import hashlib
+
+    digest = hashlib.sha256(episode_id.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:6], "big") % 10**8
+    return f"{value:08d}"
+
+
 def resolve_data_root(path: Optional[Path] = None) -> Path:
     """
     Resolve the data root, defaulting to :data:`DEFAULT_DATA_ROOT`.

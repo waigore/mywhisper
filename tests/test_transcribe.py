@@ -78,6 +78,7 @@ def build_transcriber(tmp_path: Path) -> StubTranscriber:
         show_title="Test Show",
         episode_title="Episode 1",
         source_path=tmp_path / "source.wav",
+        metadata={"episode_key": "12345678"},
     )
     chunker = StubChunker()
     transcriber = StubTranscriber(
@@ -132,8 +133,8 @@ def test_transcribe_generator_yields_events(tmp_path, monkeypatch):
 
 def test_load_cached_segments(tmp_path, monkeypatch):
     transcriber = build_transcriber(tmp_path)
-    artefact_key = "ABC12345"
-    transcript_path = transcriber.config.transcript_path(transcriber.podcast, artefact_key)
+    episode_key = transcriber.podcast.episode_key
+    transcript_path = transcriber.config.transcript_path(transcriber.podcast, episode_key)
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text(
         json.dumps(
@@ -143,14 +144,14 @@ def test_load_cached_segments(tmp_path, monkeypatch):
         )
     )
 
-    segments = transcriber.load_cached_segments(artefact_key=artefact_key)
+    segments = transcriber.load_cached_segments(episode_key=episode_key)
     assert segments[0].speaker_id == "SPEAKER_00"
 
 
 def test_transcribe_errors_without_chunks(tmp_path):
     transcriber = build_transcriber(tmp_path)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(FileNotFoundError):
         transcriber.load_cached_segments()
 
 
@@ -165,6 +166,7 @@ def test_transcriber_from_config_uses_factory(monkeypatch, tmp_path):
         show_title="Test Show",
         episode_title="Episode 2",
         source_path=tmp_path / "source.wav",
+        metadata={"episode_key": "23456789"},
     )
 
     monkeypatch.setattr(
@@ -213,9 +215,10 @@ def test_audio_chunker_iterate_chunks(tmp_path, monkeypatch):
         show_title="Show",
         episode_title="Chunk Episode",
         source_path=Path("dummy.wav"),
+        metadata={"episode_key": "34567890"},
     )
 
-    chunks = list(chunker.iterate_chunks(podcast, "ABCDEF12"))
+    chunks = list(chunker.iterate_chunks(podcast, podcast.episode_key))
     assert len(chunks) >= 1
     assert writes
 

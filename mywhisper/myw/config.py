@@ -64,14 +64,20 @@ def load_config(env_path: Optional[Path] = None) -> MywConfig:
 
     ensure_data_subdir("logs", data_root)
 
+    whisper_model = os.getenv("MYW_WHISPER_MODEL")
+    if whisper_model:
+        whisper_model = str(Path(whisper_model).expanduser().resolve())
+
+    device = os.getenv("MYW_DEVICE")
+
     return MywConfig(
         data_dir=data_root,
         db_path=db_path,
         podcast_cache_path=podcast_cache,
         podcast_db_path=podcast_db,
         log_level=os.getenv("MYW_LOG_LEVEL", "INFO"),
-        whisper_model=os.getenv("MYW_WHISPER_MODEL"),
-        device=os.getenv("MYW_DEVICE"),
+        whisper_model=whisper_model,
+        device=device,
         ollama_model=os.getenv("MYW_OLLAMA_MODEL", "llama3"),
         spacy_model=os.getenv("MYW_SPACY_MODEL", "en_core_web_sm"),
         hf_token=os.getenv("MYW_HF_TOKEN"),

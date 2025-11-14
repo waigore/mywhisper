@@ -12,7 +12,7 @@ from typing import Generator, Iterable, List, Optional, Sequence, Tuple
 
 import logging
 
-from .config import ensure_data_subdir, generate_artefact_key, resolve_data_root
+from .config import ensure_data_subdir, resolve_data_root
 from .models import (
     AudioChunk,
     DiarizedTurn,
@@ -50,20 +50,25 @@ class DiarizationConfig:
     data_root: Path = field(default_factory=resolve_data_root)
     device: Optional[str] = None
 
-    def artefact_paths(self, podcast: PodcastEpisode, artefact_key: str) -> dict[str, Path]:
+    def artefact_paths(
+        self,
+        podcast: PodcastEpisode,
+        episode_key: Optional[str] = None,
+    ) -> dict[str, Path]:
+        key = episode_key or podcast.episode_key
         slug = podcast.artefact_slug()
         return {
             "chunk_dir": ensure_data_subdir(
-                f"audio_chunks/{slug}/{artefact_key}", self.data_root
+                f"audio_chunks/{slug}/{key}", self.data_root
             ),
             "cluster_path": ensure_data_subdir(
                 f"transcripts/{slug}", self.data_root
             )
-            / f"{artefact_key}_clusters.pkl",
+            / f"{key}_clusters.pkl",
             "rttm_path": ensure_data_subdir(
                 f"transcripts/rttm", self.data_root
             )
-            / f"{slug}_{artefact_key}.rttm",
+            / f"{slug}_{key}.rttm",
         }
 
 
@@ -80,11 +85,11 @@ class ChunkScheduler:
         self.config = config
         self.logger = logger or LOGGER
 
-    def schedule(self, podcast: PodcastEpisode, artefact_key: str) -> Generator[AudioChunk, None, None]:
+    def schedule(self, podcast: PodcastEpisode, episode_key: str) -> Generator[AudioChunk, None, None]:
         chunk_seconds = max(self.config.chunk_minutes * 60.0, 1.0)
         overlap_seconds = max(self.config.overlap_seconds, 0.0)
 
-        paths = self.config.artefact_paths(podcast, artefact_key)
+        paths = self.config.artefact_paths(podcast, episode_key)
         chunk_dir = paths["chunk_dir"]
 
         waveform, sample_rate = torchaudio.load(str(podcast.source_path))
@@ -108,7 +113,7 @@ class ChunkScheduler:
             global_start = start / sample_rate
             global_end = end / sample_rate
 
-            chunk_path = chunk_dir / f"{podcast.artefact_slug()}__{artefact_key}__chunk_{index:03d}.wav"
+            chunk_path = chunk_dir / f"{podcast.artefact_slug()}__{episode_key}__chunk_{index:03d}.wav"
 
             chunk_np = chunk_tensor.transpose(0, 1).cpu().numpy()
             sf.write(str(chunk_path), chunk_np, sample_rate)
@@ -119,7 +124,7 @@ class ChunkScheduler:
                 global_end=global_end,
                 tensor=chunk_tensor,
                 sample_rate=sample_rate,
-                artefact_key=artefact_key,
+                artefact_key=episode_key,
             )
             index += 1
 
@@ -307,8 +312,8 @@ class DiarizationPipeline:
         self,
         transcript: Optional[Sequence[TranscriptSegment]],
     ) -> Generator[PipelineEvent, None, List[DiarizedTurn]]:
-        artefact_key = generate_artefact_key()
-        paths = self.config.artefact_paths(self.podcast, artefact_key)
+        episode_key = self.podcast.episode_key
+        paths = self.config.artefact_paths(self.podcast, episode_key)
         self.clusterer.prepare(paths["cluster_path"])
         self.clusterer.load()
 
@@ -319,7 +324,8 @@ class DiarizationPipeline:
             episode_id=self.podcast.episode_id,
             message=f"Starting diarization for {self.podcast.episode_title}",
             payload={
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "step": "started",
             },
             artefact_paths={
@@ -330,7 +336,8 @@ class DiarizationPipeline:
             checkpoint={
                 "status": "started",
                 "step": "diarize",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
             },
             elapsed=0.0,
         )
@@ -339,7 +346,7 @@ class DiarizationPipeline:
         diarized_turns: List[DiarizedTurn] = []
         target_num_speakers = self.clusterer.num_speakers or self.config.num_speakers
 
-        for idx, chunk in enumerate(self.scheduler.schedule(self.podcast, artefact_key)):
+        for idx, chunk in enumerate(self.scheduler.schedule(self.podcast, episode_key)):
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="chunk_ready",
@@ -358,7 +365,8 @@ class DiarizationPipeline:
                     "status": "chunk_ready",
                     "step": "diarize",
                     "chunk_index": idx,
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
@@ -380,7 +388,8 @@ class DiarizationPipeline:
                     "status": "annotation_ready",
                     "step": "diarize",
                     "chunk_index": idx,
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
@@ -417,14 +426,16 @@ class DiarizationPipeline:
                     "status": "cluster_assigned",
                     "step": "diarize",
                     "chunk_index": idx,
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
 
         self._write_rttm(paths["rttm_path"], global_annotation)
         self._last_rttm_path = paths["rttm_path"]
-        self._last_artefact_key = artefact_key
+        self._last_episode_key = episode_key
+        self._last_artefact_key = episode_key
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
@@ -435,7 +446,8 @@ class DiarizationPipeline:
             payload={
                 "path": str(paths["rttm_path"]),
                 "turns": len(diarized_turns),
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "step": "completed",
             },
             artefact_paths={
@@ -445,7 +457,8 @@ class DiarizationPipeline:
             checkpoint={
                 "status": "completed",
                 "step": "diarize",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "rttm_path": str(paths["rttm_path"]),
                 "turns": len(diarized_turns),
             },

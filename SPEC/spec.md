@@ -23,7 +23,7 @@ Tests live under `tests/` mirroring the package structure.
 - Configure logging per submodule; root logger `mywhisper` supplies baseline level.
 - Expose pipeline stages via generators so callers can orchestrate long-running work.
 - Reference original podcast files directly; avoid redundant audio copies.
-- Store temporary artefacts under `data/` with 8-character alphanumeric keys for traceability.
+- Store temporary artefacts under `data/` with deterministic eight-digit episode keys for traceability.
 - Maintain ≥90 % automated test coverage (unit and integration); enforce coverage thresholds in CI.
 - Follow KISS: limit defensive handling of unlikely error states.
 
@@ -37,8 +37,8 @@ Tests live under `tests/` mirroring the package structure.
 
 - **Temporary artefacts**
   - Base directory: `data/` (configurable). Pipelines operate relative to a `data_root: Path`.
-  - Artefact keys: eight-character mixed-case base36 strings (e.g. `A9F3D2B1`) generated via `secrets.token_hex(4).upper()`.
-  - Artefact naming template: `{podcast_slug}__{artefact_key}__{purpose}.{ext}` to allow reverse lookup.
+  - Episode keys: deterministic eight-digit strings derived from `PodcastEpisode.episode_id` (stored on the model and in catalog metadata).
+  - Artefact naming template: `{podcast_slug}__{episode_key}__{purpose}.{ext}` to allow reverse lookup.
   - Pipelines only reference the source podcast file by path; they never duplicate the original audio unless transformation is unavoidable (e.g. temporary chunk export for diarization).
 
 - **Shared domain models**
@@ -77,7 +77,7 @@ Tests live under `tests/` mirroring the package structure.
 
 - `AudioChunker`
   - Initialised with `chunk_duration`, `overlap`, `target_sample_rate`.
-  - Method `iterate_chunks(source: Path) -> Generator[AudioChunk, None, None]` yields `AudioChunk` dataclasses referencing in-memory tensors and on-disk wav paths inside `data_root/transcribe/{artefact_key}`.
+  - Method `iterate_chunks(source: Path) -> Generator[AudioChunk, None, None]` yields `AudioChunk` dataclasses referencing in-memory tensors and on-disk wav paths inside `data_root/transcribe/{episode_key}`.
   - Resamples via `torchaudio.transforms.Resample` only when necessary.
   - Ensures stereo audio is downmixed to mono, mirroring `examples/transcribe_audio.py`.
 
@@ -86,11 +86,11 @@ Tests live under `tests/` mirroring the package structure.
   - `from_config(podcast: PodcastEpisode, config: TranscriptionConfig) -> PodcastTranscriber` loads the model and chunker.
   - `transcribe(yield_progress: bool = False) -> list[TranscriptSegment] | Generator[PipelineEvent, None, list[TranscriptSegment]]`
     - Steps: `prepare_audio` (full audio or chunked), `run_model` (calls `model.transcribe`), `normalize_segments` (convert centiseconds to seconds via `WHISPER_TIME_FACTOR` equivalent), `persist_transcript`.
-    - Persists transcripts under `data/transcripts/{podcast_slug}/{artefact_key}_whisper.json`.
+    - Persists transcripts under `data/transcripts/{podcast_slug}/{episode_key}_whisper.json`.
   - `load_cached_segments() -> list[TranscriptSegment]` reads a previously stored transcript.
 
 #### Artefacts
-- Extracted chunk files only exist when chunking is required. Each chunk is stored once and reused between runs, keyed by artefact ID.
+- Extracted chunk files only exist when chunking is required. Each chunk is stored once and reused between runs, keyed by the episode’s eight-digit `episode_key`.
 - Transcript JSON schema matches example script output: list of dicts with `start`, `end`, `text`.
 
 ---
@@ -117,7 +117,7 @@ Tests live under `tests/` mirroring the package structure.
   - Handles moving models to `config.device`.
 
 - `SpeakerClusterer`
-  - Maintains reference embeddings (`joblib` persistence to `data/transcripts/{podcast_slug}/{artefact_key}_clusters.pkl`).
+  - Maintains reference embeddings (`joblib` persistence to `data/transcripts/{podcast_slug}/{episode_key}_clusters.pkl`).
   - Methods: `fit_reference(chunk: AudioChunk, annotation: Annotation) -> None`, `assign(embeddings: np.ndarray) -> np.ndarray` (returns speaker ids), `save/load`.
 
 - `DiarizationPipeline`
@@ -129,13 +129,13 @@ Tests live under `tests/` mirroring the package structure.
     3. `embeddings_extracted`
     4. `cluster_assignment`
     5. `segment_committed`
-  - Aggregates `pyannote.core.Annotation` into global annotation, stores RTTM under `data/transcripts/rttm/{podcast_slug}_{artefact_key}.rttm`.
+  - Aggregates `pyannote.core.Annotation` into global annotation, stores RTTM under `data/transcripts/rttm/{podcast_slug}_{episode_key}.rttm`.
   - Returns structured diarization results: `list[DiarizedTurn]` where `DiarizedTurn` includes `start`, `end`, `speaker_id`.
   - Exposes `write_json_transcript(target: Path, transcript: list[TranscriptSegment])` to combine with raw transcript (keeping `speaker_id` placeholders).
 
-#### Artefacts
-- Chunk WAV files: `data/audio_chunks/{podcast_slug}/{artefact_key}/chunk_{idx:03d}.wav`.
-- Cluster cache: `data/transcripts/{podcast_slug}/{artefact_key}_clusters.pkl`.
+-#### Artefacts
+- Chunk WAV files: `data/audio_chunks/{podcast_slug}/{episode_key}/chunk_{idx:03d}.wav`.
+- Cluster cache: `data/transcripts/{podcast_slug}/{episode_key}_clusters.pkl`.
 - Diarization JSON (optional) mirrors `whisper_diarization.json`.
 
 ---
@@ -172,13 +172,12 @@ Tests live under `tests/` mirroring the package structure.
     - `critic(assignments) -> dict[str, bool]`
     - `consolidate(prior, new) -> dict[str, SpeakerAssignment]`
 
-- `TranscriptAssigner`
   - Constructor parameters: `podcast`, `config`, `profile_builder`, `roster`, `llm_client`, `logger`.
   - `from_config(podcast, diarized_segments, transcript_path, config)` to auto-load transcript and dependencies.
   - `assign_names(yield_progress: bool = False) -> list[TranscriptSegment] | Generator[PipelineEvent, None, list[TranscriptSegment]]`
     - Steps: `load_diarized_transcript`, `build_profiles`, `prepare_roster`, `run_inference_cycle`, `critic_pass`, optional refinement.
     - Enforces high-confidence rule: assignments below threshold are labelled `"UNKNOWN"`.
-    - Persists enriched transcript under `data/transcripts/{podcast_slug}/{artefact_key}_with_names.json`.
+    - Persists enriched transcript under `data/transcripts/{podcast_slug}/{episode_key}_with_names.json`.
 
 #### Artefacts
 - Assignment summary persisted as JSON list aligning with `examples/infer_speaker_names.py`.
@@ -197,7 +196,7 @@ Tests live under `tests/` mirroring the package structure.
 - SQLite database stored at `data/podcasts/catalog.db`.
 - Tables:
   - `episodes(id TEXT PRIMARY KEY, show_title TEXT, episode_title TEXT, author TEXT, guid TEXT, published_at TEXT, cache_path TEXT, audio_path TEXT, duration_sec REAL, metadata_json TEXT)`.
-  - `artefacts(artefact_key TEXT PRIMARY KEY, episode_id TEXT, kind TEXT, path TEXT, created_at TEXT)`.
+  - `artefacts(artefact_key TEXT PRIMARY KEY, episode_id TEXT, kind TEXT, path TEXT, created_at TEXT)` — `artefact_key` stores the same eight-digit `episode_key` recorded in episode metadata.
 - Indices on `show_title`, `guid`, and `published_at`.
 
 #### Key Classes
@@ -205,7 +204,7 @@ Tests live under `tests/` mirroring the package structure.
   - Constructor accepts `db_path: Path`, ensures schema initialised.
   - `upsert_episode(episode: PodcastEpisode) -> None`, `get_episode(id | guid | path) -> PodcastEpisode | None`.
   - `list_episodes(show_title: Optional[str] = None, since: Optional[datetime] = None) -> Iterable[PodcastEpisode]`.
-  - `record_artefact(episode_id: str, kind: str, path: Path, artefact_key: str)`.
+  - `record_artefact(episode_id: str, kind: str, path: Path, artefact_key: str)` persists artefact paths indexed by the episode’s `episode_key`.
 
 - `ApplePodcastsImporter`
   - Initialized with cache roots (`cache_root`, `db_path`), optional `mdls` enrichment flag.

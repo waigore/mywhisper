@@ -197,6 +197,7 @@ class PodcastCatalog:
         metadata = dict(episode.metadata or {})
         if episode.description is not None:
             metadata.setdefault("description", episode.description)
+        metadata.setdefault("episode_key", episode.episode_key)
         cache_path = metadata.get("cache_path")
 
         payload = {

@@ -37,7 +37,7 @@ class MywApp(App[None]):
 
         self.catalog = PodcastCatalog(data_root=self.config.data_dir)
         self.catalog_service = CatalogService(self.config, self.catalog)
-        self.queue = QueueController()
+        self.queue = QueueController(enqueue_delay=3.0)
         self.checkpoints = CheckpointStore(self.config.db_path)
         self.pipeline_runner = PipelineRunner(
             config=self.config,

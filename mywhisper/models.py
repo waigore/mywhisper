@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TYPE_CHECKING
 
-from .config import generate_artefact_key
+from .config import derive_episode_key, generate_artefact_key
 
 if TYPE_CHECKING:
     import torch
@@ -59,6 +59,23 @@ class PodcastEpisode:
         base = f"{self.show_title}__{self.episode_title}".lower()
         slug = "".join(ch if ch.isalnum() else "_" for ch in base)
         return "_".join(filter(None, slug.split("_")))
+
+    @property
+    def episode_key(self) -> str:
+        """Return the deterministic eight-digit key for this episode."""
+        meta = self.metadata
+        existing = None
+        if isinstance(meta, dict):
+            value = meta.get("episode_key")
+            if isinstance(value, str) and len(value) == 8 and value.isdigit():
+                existing = value
+        if existing:
+            return existing
+
+        key = derive_episode_key(self.episode_id)
+        if isinstance(meta, dict):
+            meta["episode_key"] = key
+        return key
 
 
 @dataclass(slots=True)

@@ -16,7 +16,7 @@ from collections import defaultdict
 import requests
 import spacy
 
-from .config import ensure_data_subdir, generate_artefact_key, resolve_data_root
+from .config import ensure_data_subdir, resolve_data_root
 from .models import (
     PipelineEvent,
     PodcastEpisode,
@@ -43,10 +43,15 @@ class AssignmentConfig:
     output_dir: Path = field(default_factory=lambda: ensure_data_subdir("transcripts"))
     data_root: Path = field(default_factory=resolve_data_root)
 
-    def assignment_path(self, podcast: PodcastEpisode, artefact_key: str) -> Path:
+    def assignment_path(
+        self,
+        podcast: PodcastEpisode,
+        episode_key: Optional[str] = None,
+    ) -> Path:
+        key = episode_key or podcast.episode_key
         slug = podcast.artefact_slug()
         dir_path = ensure_data_subdir(f"transcripts/{slug}", self.data_root)
-        return dir_path / f"{artefact_key}_with_names.json"
+        return dir_path / f"{key}_with_names.json"
 
 
 class SpeakerProfileBuilder:
@@ -317,8 +322,8 @@ class TranscriptAssigner:
         segments: Sequence[TranscriptSegment],
         metadata: Dict[str, str],
     ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
-        artefact_key = generate_artefact_key()
-        assignment_path = self.config.assignment_path(self.podcast, artefact_key)
+        episode_key = self.podcast.episode_key
+        assignment_path = self.config.assignment_path(self.podcast, episode_key)
         start_time = time.perf_counter()
 
         yield PipelineEvent(
@@ -327,7 +332,8 @@ class TranscriptAssigner:
             episode_id=self.podcast.episode_id,
             message=f"Assigning speaker names for {self.podcast.episode_title}",
             payload={
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "segment_count": len(segments),
                 "step": "started",
             },
@@ -335,7 +341,8 @@ class TranscriptAssigner:
             checkpoint={
                 "status": "started",
                 "step": "assign",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
             },
             elapsed=0.0,
         )
@@ -360,7 +367,8 @@ class TranscriptAssigner:
             checkpoint={
                 "status": "profiles_ready",
                 "step": "assign",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
             },
             elapsed=elapsed,
         )
@@ -402,7 +410,8 @@ class TranscriptAssigner:
             checkpoint={
                 "status": "inference_round",
                 "step": "assign",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
             },
             elapsed=elapsed,
         )
@@ -437,7 +446,8 @@ class TranscriptAssigner:
                 checkpoint={
                     "status": "refinement_round",
                     "step": "assign",
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
@@ -459,7 +469,8 @@ class TranscriptAssigner:
         enriched_segments = self._label_segments(segments, final_assignments)
         self._persist_assignments(assignment_path, enriched_segments)
         self._last_assignment_path = assignment_path
-        self._last_artefact_key = artefact_key
+        self._last_episode_key = episode_key
+        self._last_artefact_key = episode_key
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
@@ -470,14 +481,16 @@ class TranscriptAssigner:
             payload={
                 "path": str(assignment_path),
                 "segments": len(enriched_segments),
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "step": "completed",
             },
             artefact_paths={"assignment": assignment_path},
             checkpoint={
                 "status": "completed",
                 "step": "assign",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "assignment_path": str(assignment_path),
                 "segments": len(enriched_segments),
             },

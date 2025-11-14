@@ -12,7 +12,7 @@ from typing import Generator, Iterable, List, Optional, Sequence
 
 import logging
 
-from .config import ensure_data_subdir, generate_artefact_key, resolve_data_root
+from .config import ensure_data_subdir, resolve_data_root
 from .models import AudioChunk, PipelineEvent, PodcastEpisode, TranscriptSegment
 
 import torch
@@ -41,14 +41,24 @@ class TranscriptionConfig:
     device: Optional[str] = None
     data_root: Path = field(default_factory=resolve_data_root)
 
-    def transcript_path(self, podcast: PodcastEpisode, artefact_key: str) -> Path:
+    def transcript_path(
+        self,
+        podcast: PodcastEpisode,
+        episode_key: Optional[str] = None,
+    ) -> Path:
+        key = episode_key or podcast.episode_key
         slug = podcast.artefact_slug()
         target_dir = ensure_data_subdir(f"transcripts/{slug}", self.data_root)
-        return target_dir / f"{artefact_key}_whisper.json"
+        return target_dir / f"{key}_whisper.json"
 
-    def chunk_dir(self, podcast: PodcastEpisode, artefact_key: str) -> Path:
+    def chunk_dir(
+        self,
+        podcast: PodcastEpisode,
+        episode_key: Optional[str] = None,
+    ) -> Path:
+        key = episode_key or podcast.episode_key
         slug = podcast.artefact_slug()
-        return ensure_data_subdir(f"audio_chunks/{slug}/{artefact_key}", self.data_root)
+        return ensure_data_subdir(f"audio_chunks/{slug}/{key}", self.data_root)
 
 
 class WhisperModelFactory:
@@ -87,7 +97,7 @@ class AudioChunker:
     def iterate_chunks(
         self,
         podcast: PodcastEpisode,
-        artefact_key: str,
+        episode_key: str,
     ) -> Generator[AudioChunk, None, None]:
         """
         Yield audio chunks for the podcast.
@@ -116,11 +126,11 @@ class AudioChunker:
                 global_end=total_duration,
                 tensor=waveform,
                 sample_rate=sample_rate,
-                artefact_key=artefact_key,
+                artefact_key=episode_key,
             )
             return
 
-        chunk_dir = self.config.chunk_dir(podcast, artefact_key)
+        chunk_dir = self.config.chunk_dir(podcast, episode_key)
         chunk_duration = max(self.chunk_duration, 0.1)
         chunk_samples = int(chunk_duration * sample_rate)
         if chunk_samples <= 0:
@@ -135,7 +145,7 @@ class AudioChunker:
             chunk_tensor = waveform[start:end]
             start_sec = start / sample_rate
             end_sec = end / sample_rate
-            chunk_path = chunk_dir / f"{podcast.artefact_slug()}__{artefact_key}__chunk_{index:03d}.wav"
+            chunk_path = chunk_dir / f"{podcast.artefact_slug()}__{episode_key}__chunk_{index:03d}.wav"
 
             chunk_np = chunk_tensor.cpu().numpy().astype("float32", copy=False)
             sf.write(str(chunk_path), chunk_np, sample_rate)
@@ -146,7 +156,7 @@ class AudioChunker:
                 global_end=end_sec,
                 tensor=chunk_tensor,
                 sample_rate=sample_rate,
-                artefact_key=artefact_key,
+                artefact_key=episode_key,
             )
             index += 1
 
@@ -198,14 +208,23 @@ class PodcastTranscriber:
         except StopIteration as stop:
             return stop.value
 
-    def load_cached_segments(self, artefact_key: Optional[str] = None) -> List[TranscriptSegment]:
+    def load_cached_segments(
+        self,
+        episode_key: Optional[str] = None,
+        *,
+        artefact_key: Optional[str] = None,
+    ) -> List[TranscriptSegment]:
         """
         Load a previously persisted transcript if available.
         """
 
-        key = artefact_key or getattr(self, "_last_artefact_key", None)
+        key = episode_key or artefact_key
         if not key:
-            raise ValueError("No artefact key specified, and no cached transcription available.")
+            key = getattr(self, "_last_episode_key", None) or getattr(self, "_last_artefact_key", None)
+        if not key:
+            key = self.podcast.episode_key
+        if not key:
+            raise ValueError("No episode key specified, and no cached transcription available.")
 
         path = self.config.transcript_path(self.podcast, key)
         if not path.exists():
@@ -237,8 +256,8 @@ class PodcastTranscriber:
     def _transcription_pipeline(
         self,
     ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
-        artefact_key = generate_artefact_key()
-        transcript_path = self.config.transcript_path(self.podcast, artefact_key)
+        episode_key = self.podcast.episode_key
+        transcript_path = self.config.transcript_path(self.podcast, episode_key)
         start_time = time.perf_counter()
         segments: List[TranscriptSegment] = []
 
@@ -250,19 +269,21 @@ class PodcastTranscriber:
             payload={
                 "episode_id": self.podcast.episode_id,
                 "source": str(self.podcast.source_path),
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "step": "started",
             },
             checkpoint={
                 "status": "started",
                 "step": "transcribe",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
             },
             artefact_paths={"transcript": transcript_path},
             elapsed=0.0,
         )
 
-        for idx, chunk in enumerate(self.chunker.iterate_chunks(self.podcast, artefact_key)):
+        for idx, chunk in enumerate(self.chunker.iterate_chunks(self.podcast, episode_key)):
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="chunk_prepared",
@@ -281,7 +302,8 @@ class PodcastTranscriber:
                     "status": "chunk_prepared",
                     "step": "transcribe",
                     "chunk_index": idx,
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
@@ -304,14 +326,16 @@ class PodcastTranscriber:
                     "status": "chunk_completed",
                     "step": "transcribe",
                     "chunk_index": idx,
-                    "artefact_key": artefact_key,
+                    "artefact_key": episode_key,
+                    "episode_key": episode_key,
                 },
                 elapsed=elapsed,
             )
 
         self._persist_transcript(transcript_path, segments)
         self._last_transcript_path = transcript_path
-        self._last_artefact_key = artefact_key
+        self._last_episode_key = episode_key
+        self._last_artefact_key = episode_key
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
@@ -322,14 +346,16 @@ class PodcastTranscriber:
             payload={
                 "path": str(transcript_path),
                 "segment_count": len(segments),
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "step": "completed",
             },
             artefact_paths={"transcript": transcript_path},
             checkpoint={
                 "status": "completed",
                 "step": "transcribe",
-                "artefact_key": artefact_key,
+                "artefact_key": episode_key,
+                "episode_key": episode_key,
                 "transcript_path": str(transcript_path),
                 "segment_count": len(segments),
             },
