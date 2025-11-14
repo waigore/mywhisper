@@ -33,6 +33,7 @@ class PodcastListingScreen(Screen):
         Binding("v", "view", "View Episode", show=True),
         Binding("enter", "view", "View Episode", show=False),
         Binding("s", "toggle_stop", "Stop / Resume", show=True),
+        Binding("q", "quit", "Quit", show=True),
     ]
 
     def __init__(
@@ -96,6 +97,10 @@ class PodcastListingScreen(Screen):
                 episode_id,
             )
             self._enqueue_callback(episode_id)
+
+    async def action_quit(self) -> None:
+        LOGGER.info("Quit requested from listing screen")
+        await self.app.action_quit()
 
     async def refresh_catalog(self) -> None:
         episodes = await asyncio.to_thread(self.catalog_service.sync_from_cache)

@@ -86,6 +86,8 @@ def _cached_lookup_episode_metadata(db_path: str, audio_filename: str) -> Option
                 e.ZPUBDATE AS episode_pubdate,
                 e.ZSEASONNUMBER AS season_number,
                 e.ZEPISODENUMBER AS episode_number,
+                e.ZITEMDESCRIPTION AS item_description,
+                e.ZITEMDESCRIPTIONWITHOUTHTML AS item_description_plain,
                 p.ZTITLE AS podcast_title
             FROM ZMTEPISODE e
             LEFT JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
@@ -459,12 +461,17 @@ class ApplePodcastsImporter:
         if published_at is None and db_meta:
             published_at = _coredata_ts_to_datetime(db_meta.get("episode_pubdate"))
 
+        db_description_plain = (db_meta or {}).get("item_description_plain")
+        db_description_html = (db_meta or {}).get("item_description")
+
         description = self._first_non_empty(
             plist_data.get("episodeDescription"),
             plist_data.get("description"),
             plist_data.get("longDescription"),
             plist_data.get("subtitle"),
             plist_data.get("summary"),
+            db_description_plain,
+            db_description_html,
         )
 
         extra = dict(plist_data)
@@ -475,6 +482,10 @@ class ApplePodcastsImporter:
             extra.setdefault("mdls", mdls_meta)
         if description:
             extra.setdefault("description", description)
+        elif db_description_plain:
+            extra.setdefault("description", db_description_plain)
+        elif db_description_html:
+            extra.setdefault("description", db_description_html)
 
         return EpisodeMetadata(
             cache_entry=entry,

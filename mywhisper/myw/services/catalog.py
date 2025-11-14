@@ -103,8 +103,11 @@ class CatalogService:
         except OSError:
             LOGGER.debug("Unable to read size for %s", episode.source_path)
 
+        episode_key = episode.episode_key
+
         return EpisodeViewState(
             episode_id=episode.episode_id,
+            episode_key=episode_key,
             show_title=show_title,
             episode_title=episode_title,
             downloaded_at=downloaded_at,

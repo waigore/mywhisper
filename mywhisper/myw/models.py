@@ -9,6 +9,7 @@ from typing import Optional
 @dataclass(slots=True)
 class EpisodeViewState:
     episode_id: str
+    episode_key: str
     show_title: str
     episode_title: str
     downloaded_at: Optional[datetime]

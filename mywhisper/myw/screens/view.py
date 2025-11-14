@@ -66,5 +66,7 @@ class PodcastViewScreen(Screen):
             table.add_row("File Size", f"{self.episode.file_size / (1024 * 1024):.2f} MB")
         if self.episode.audio_path:
             table.add_row("Audio Path", str(Path(self.episode.audio_path)))
+        table.add_row("Episode ID", self.episode.episode_id)
+        table.add_row("Episode Key", self.episode.episode_key)
         self.detail.update(table)
 

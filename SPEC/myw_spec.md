@@ -60,6 +60,7 @@ mywhisper/myw/
   myw.py                # CLI entry: `textual run mywhisper.myw.myw:MywApp` (or direct `python -m mywhisper.myw.myw`)
 ```
 
+- `EpisodeViewState` retains both the canonical `episode_id` and the derived eight-digit `episode_key` so UI layers can display human-friendly metadata while still surfacing the artefact key reused by pipeline artefacts and logs.
 - Keep public entrypoint slim; business logic resides in services.
 - Provide unit-testable services independent of Textual by using plain Python classes.
 
@@ -105,7 +106,7 @@ mywhisper/myw/
 ## Podcast View Screen
 
 - Displays metadata for selected episode:
-  - Podcast title, Episode title, Description (render `N/A` when unavailable), File size, Duration, Download path, Current status.
+  - Podcast title, Episode title, Description (render `N/A` when unavailable), File size, Duration, Download path, Current status, Episode ID, Episode key (same deterministic key surfaced in pipeline events and artefact paths).
   - If transcription artifacts exist, show summary (transcript path, diarization status).
 - Commands:
   - `(b)` returns to `PodcastListingScreen`, preserving the prior table selection.
