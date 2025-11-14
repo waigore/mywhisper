@@ -14,6 +14,8 @@ transformers = ">=4.39"
 ollama = "*"
 pydub = "*"
 spacy = "*"
+textual = "*"
+dotenv = "*"
 
 [dev-packages]
 pytest = "*"

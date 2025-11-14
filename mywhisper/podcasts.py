@@ -10,10 +10,12 @@ import re
 import shutil
 import logging
 import sqlite3
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from functools import lru_cache
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple
 
 from .config import ensure_data_subdir, resolve_data_root
@@ -62,6 +64,107 @@ def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+@lru_cache(maxsize=256)
+def _cached_lookup_episode_metadata(db_path: str, audio_filename: str) -> Optional[Dict[str, Any]]:
+    path = Path(db_path)
+    if not path.exists():
+        return None
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        LOGGER.debug("Unable to open podcasts database %s: %s", path, exc)
+        return None
+
+    conn.row_factory = sqlite3.Row
+    try:
+        query = """
+            SELECT
+                e.ZTITLE AS episode_title,
+                e.ZAUTHOR AS episode_author,
+                e.ZGUID AS episode_guid,
+                e.ZPUBDATE AS episode_pubdate,
+                e.ZSEASONNUMBER AS season_number,
+                e.ZEPISODENUMBER AS episode_number,
+                p.ZTITLE AS podcast_title
+            FROM ZMTEPISODE e
+            LEFT JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
+            WHERE e.ZASSETURL LIKE ?
+            ORDER BY e.ZPUBDATE DESC
+            LIMIT 1
+        """
+        cursor = conn.execute(query, (f"%/{audio_filename}",))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error as exc:
+        LOGGER.debug("Database lookup failed for %s: %s", audio_filename, exc)
+        return None
+    finally:
+        conn.close()
+
+
+def _lookup_episode_metadata(db_path: Optional[Path], audio_filename: str) -> Optional[Dict[str, Any]]:
+    if not db_path:
+        return None
+    return _cached_lookup_episode_metadata(str(db_path), audio_filename)
+
+
+def _coredata_ts_to_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        # Core Data timestamps are seconds since 2001-01-01.
+        return datetime(2001, 1, 1) + timedelta(seconds=seconds)
+    except Exception:
+        return None
+
+
+def _extract_mdls_metadata(src_audio: Path) -> Dict[str, str]:
+    """
+    Use macOS Spotlight metadata (`mdls`) to populate album/title fields.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "mdls",
+                "-name",
+                "kMDItemAlbum",
+                "-name",
+                "kMDItemTitle",
+                "-name",
+                "kMDItemAuthors",
+                str(src_audio),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return {}
+
+    meta: Dict[str, str] = {}
+    for raw_line in result.stdout.splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        cleaned = value.strip().strip('"')
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = ",".join(
+                part.strip().strip('"')
+                for part in cleaned.strip("()").split(",")
+                if part.strip()
+            )
+        cleaned = cleaned.strip()
+        if cleaned and cleaned.lower() not in {"(null)", "null"}:
+            meta[key.strip()] = cleaned
+    return meta
+
+
 class PodcastCatalog:
     """
     SQLite-backed catalog of podcast episodes.
@@ -91,6 +194,11 @@ class PodcastCatalog:
             conn.close()
 
     def upsert_episode(self, episode: PodcastEpisode) -> None:
+        metadata = dict(episode.metadata or {})
+        if episode.description is not None:
+            metadata.setdefault("description", episode.description)
+        cache_path = metadata.get("cache_path")
+
         payload = {
             "id": episode.episode_id,
             "show_title": episode.show_title,
@@ -98,10 +206,10 @@ class PodcastCatalog:
             "author": episode.author,
             "guid": episode.guid,
             "published_at": _to_iso(episode.published_at),
-            "cache_path": episode.metadata.get("cache_path"),
+            "cache_path": cache_path,
             "audio_path": str(episode.source_path),
             "duration_sec": episode.duration_sec,
-            "metadata_json": json.dumps(episode.metadata),
+            "metadata_json": json.dumps(metadata),
         }
         with self._connect() as conn:
             conn.execute(
@@ -147,6 +255,7 @@ class PodcastCatalog:
         if not row:
             return None
         metadata = json.loads(row[8] or "{}")
+        description = metadata.get("description")
         published_at = datetime.fromisoformat(row[5]) if row[5] else None
         return PodcastEpisode(
             episode_id=row[0],
@@ -155,6 +264,7 @@ class PodcastCatalog:
             author=row[3],
             guid=row[4],
             published_at=published_at,
+            description=description,
             source_path=Path(row[6]),
             duration_sec=row[7],
             metadata=metadata,
@@ -187,6 +297,7 @@ class PodcastCatalog:
                     author=row[3],
                     guid=row[4],
                     published_at=published_at,
+                    description=metadata.get("description"),
                     source_path=Path(row[6]),
                     duration_sec=row[7],
                     metadata=metadata,
@@ -206,6 +317,7 @@ class EpisodeMetadata:
     author: Optional[str] = None
     guid: Optional[str] = None
     published_at: Optional[datetime] = None
+    description: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_episode(self) -> PodcastEpisode:
@@ -215,6 +327,8 @@ class EpisodeMetadata:
                 "cache_path": str(self.cache_entry),
             }
         )
+        if self.description:
+            metadata.setdefault("description", self.description)
         return PodcastEpisode(
             episode_id=self.guid or self.audio_path.stem,
             show_title=self.show_title,
@@ -222,6 +336,7 @@ class EpisodeMetadata:
             author=self.author,
             guid=self.guid,
             published_at=self.published_at,
+            description=self.description,
             source_path=self.audio_path,
             metadata=metadata,
         )
@@ -239,12 +354,14 @@ class ApplePodcastsImporter:
         output_dir: Optional[Path] = None,
         move: bool = False,
         logger: Optional[logging.Logger] = None,
+        db_path: Optional[Path] = None,
     ) -> None:
         self.cache_root = cache_root
         self.catalog = catalog
         self.output_dir = (output_dir or ensure_data_subdir("podcasts")).resolve()
         self.move = move
         self.logger = logger or LOGGER
+        self.db_path = db_path
 
     def scan(self) -> Generator[EpisodeMetadata, None, None]:
         if not self.cache_root.exists():
@@ -310,27 +427,53 @@ class ApplePodcastsImporter:
                 except Exception as exc:  # pragma: no cover - best effort
                     self.logger.debug("Failed to read %s: %s", plist_path, exc)
 
+        mdls_meta = _extract_mdls_metadata(audio_path)
+        db_meta = _lookup_episode_metadata(self.db_path, audio_path.name)
+
         show_title = self._first_non_empty(
             plist_data.get("podcastTitle"),
+            (db_meta or {}).get("podcast_title"),
+            mdls_meta.get("kMDItemAlbum"),
             entry.name if entry.is_dir() else audio_path.parent.name,
             "Unknown Show",
         )
         episode_title = self._first_non_empty(
             plist_data.get("episodeTitle"),
+            (db_meta or {}).get("episode_title"),
+            mdls_meta.get("kMDItemTitle"),
             audio_path.stem,
         )
         author = self._first_non_empty(
             plist_data.get("author"),
             plist_data.get("podcastAuthor"),
+            (db_meta or {}).get("episode_author"),
+            mdls_meta.get("kMDItemAuthors"),
         )
         guid = self._first_non_empty(
             plist_data.get("episodeGuid"),
             plist_data.get("guid"),
+            (db_meta or {}).get("episode_guid"),
         )
         published_at = self._parse_timestamp(plist_data.get("releaseDate"))
+        if published_at is None and db_meta:
+            published_at = _coredata_ts_to_datetime(db_meta.get("episode_pubdate"))
+
+        description = self._first_non_empty(
+            plist_data.get("episodeDescription"),
+            plist_data.get("description"),
+            plist_data.get("longDescription"),
+            plist_data.get("subtitle"),
+            plist_data.get("summary"),
+        )
 
         extra = dict(plist_data)
         extra["cache_entry"] = str(entry)
+        if db_meta:
+            extra.setdefault("podcasts_db", db_meta)
+        if mdls_meta:
+            extra.setdefault("mdls", mdls_meta)
+        if description:
+            extra.setdefault("description", description)
 
         return EpisodeMetadata(
             cache_entry=entry,
@@ -340,6 +483,7 @@ class ApplePodcastsImporter:
             author=author,
             guid=guid,
             published_at=published_at,
+            description=description or None,
             extra=extra,
         )
 

@@ -42,7 +42,7 @@ Tests live under `tests/` mirroring the package structure.
   - Pipelines only reference the source podcast file by path; they never duplicate the original audio unless transformation is unavoidable (e.g. temporary chunk export for diarization).
 
 - **Shared domain models**
-  - `PodcastEpisode`: dataclass capturing `episode_id`, `show_title`, `episode_title`, `published_at`, `author`, `source_path`, `duration_sec`, `metadata` (dict).
+  - `PodcastEpisode`: dataclass capturing `episode_id`, `show_title`, `episode_title`, `description` (optional str), `published_at`, `author`, `source_path`, `duration_sec`, `metadata` (dict).
   - `TranscriptSegment`: dataclass with `start`, `end`, `text`, optional `speaker_id`, `speaker_name`, `confidence`, `metadata`.
   - `SpeakerCluster`: dataclass wrapping diarization output (`speaker_id`, `segments: list[Segment]`, `profile: SpeakerProfile`).
 
@@ -52,7 +52,8 @@ Tests live under `tests/` mirroring the package structure.
 
 - **Pipelines as generators**
   - Long-running processes (chunk extraction, diarization, LLM inference) expose generator stages, allowing callers to iterate over progress and optionally short-circuit.
-  - Public pipeline methods accept `yield_progress: bool = False`; when enabled they return iterables yielding structured progress events (`PipelineEvent` dataclass with `stage`, `payload`, `elapsed`).
+  - Public pipeline methods accept `yield_progress: bool = False`; when enabled they return iterables yielding structured progress events (`PipelineEvent` dataclass with `stage`, `step_name`, `payload`, `elapsed`).
+  - Events expose enough metadata (episode id, step identifiers, artefact paths) for external adapters to persist checkpoints without modifying core pipeline control flow.
 
 ---
 

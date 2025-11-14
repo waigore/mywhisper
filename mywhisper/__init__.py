@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from .checkpoints import CheckpointStore, PipelineEventAdapter, PipelineCheckpoint
 from .config import DEFAULT_DATA_ROOT, ensure_data_subdir, generate_artefact_key
 from .models import (
     PipelineEvent,
@@ -24,6 +25,9 @@ __all__ = [
     "DEFAULT_DATA_ROOT",
     "ensure_data_subdir",
     "generate_artefact_key",
+    "PipelineCheckpoint",
+    "CheckpointStore",
+    "PipelineEventAdapter",
     "PipelineEvent",
     "PodcastEpisode",
     "TranscriptSegment",

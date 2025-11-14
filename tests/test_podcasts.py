@@ -19,6 +19,7 @@ def create_cache_entry(cache_root: Path) -> Path:
         "author": "Host Name",
         "episodeGuid": "guid-123",
         "releaseDate": datetime(2024, 1, 1).timestamp(),
+        "episodeDescription": "An episode about testing.",
     }
     with (entry / "metadata.plist").open("wb") as handle:
         plistlib.dump(metadata, handle)
@@ -50,6 +51,8 @@ def test_importer_registers_episode(tmp_path):
     assert stored is not None
     assert stored.episode_title == "Great Episode"
     assert stored.source_path.exists()
+    assert stored.description == "An episode about testing."
+    assert stored.metadata.get("description") == "An episode about testing."
 
 
 def test_catalog_lists_by_show(tmp_path):
@@ -58,6 +61,7 @@ def test_catalog_lists_by_show(tmp_path):
         episode_id="id-1",
         show_title="Another Show",
         episode_title="Episode A",
+        description="Sample description.",
         source_path=tmp_path / "audio.m4a",
         published_at=datetime(2024, 2, 1),
     )
@@ -65,4 +69,5 @@ def test_catalog_lists_by_show(tmp_path):
 
     results = list(catalog.list_episodes(show_title="Another Show"))
     assert len(results) == 1
+    assert results[0].description == "Sample description."
 

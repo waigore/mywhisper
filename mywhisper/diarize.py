@@ -315,8 +315,23 @@ class DiarizationPipeline:
         start_time = time.perf_counter()
         yield PipelineEvent(
             stage="start",
+            step_name="diarize",
+            episode_id=self.podcast.episode_id,
             message=f"Starting diarization for {self.podcast.episode_title}",
-            payload={"artefact_key": artefact_key},
+            payload={
+                "artefact_key": artefact_key,
+                "step": "started",
+            },
+            artefact_paths={
+                "chunk_dir": paths["chunk_dir"],
+                "cluster": paths["cluster_path"],
+                "rttm": paths["rttm_path"],
+            },
+            checkpoint={
+                "status": "started",
+                "step": "diarize",
+                "artefact_key": artefact_key,
+            },
             elapsed=0.0,
         )
 
@@ -328,11 +343,22 @@ class DiarizationPipeline:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="chunk_ready",
+                step_name="diarize",
+                episode_id=self.podcast.episode_id,
                 message=f"Scheduled chunk {idx}",
                 payload={
+                    "chunk_index": idx,
                     "chunk_path": str(chunk.path),
                     "start": chunk.global_start,
                     "end": chunk.global_end,
+                    "step": "chunk_ready",
+                },
+                artefact_paths={"chunk": chunk.path},
+                checkpoint={
+                    "status": "chunk_ready",
+                    "step": "diarize",
+                    "chunk_index": idx,
+                    "artefact_key": artefact_key,
                 },
                 elapsed=elapsed,
             )
@@ -342,8 +368,20 @@ class DiarizationPipeline:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="annotation_ready",
+                step_name="diarize",
+                episode_id=self.podcast.episode_id,
                 message=f"Diarized chunk {idx}",
-                payload={"segment_count": len(list(annotation.itertracks()))},
+                payload={
+                    "chunk_index": idx,
+                    "segment_count": len(list(annotation.itertracks())),
+                    "step": "annotation_ready",
+                },
+                checkpoint={
+                    "status": "annotation_ready",
+                    "step": "diarize",
+                    "chunk_index": idx,
+                    "artefact_key": artefact_key,
+                },
                 elapsed=elapsed,
             )
 
@@ -367,8 +405,20 @@ class DiarizationPipeline:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="cluster_assigned",
+                step_name="diarize",
+                episode_id=self.podcast.episode_id,
                 message=f"Assigned speakers for chunk {idx}",
-                payload={"turns": len(turns)},
+                payload={
+                    "chunk_index": idx,
+                    "turns": len(turns),
+                    "step": "cluster_assigned",
+                },
+                checkpoint={
+                    "status": "cluster_assigned",
+                    "step": "diarize",
+                    "chunk_index": idx,
+                    "artefact_key": artefact_key,
+                },
                 elapsed=elapsed,
             )
 
@@ -379,8 +429,26 @@ class DiarizationPipeline:
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="persisted",
+            step_name="diarize",
+            episode_id=self.podcast.episode_id,
             message="Persisted diarization RTTM",
-            payload={"path": str(paths["rttm_path"]), "turns": len(diarized_turns)},
+            payload={
+                "path": str(paths["rttm_path"]),
+                "turns": len(diarized_turns),
+                "artefact_key": artefact_key,
+                "step": "completed",
+            },
+            artefact_paths={
+                "rttm": paths["rttm_path"],
+                "cluster_dir": paths["cluster_path"],
+            },
+            checkpoint={
+                "status": "completed",
+                "step": "diarize",
+                "artefact_key": artefact_key,
+                "rttm_path": str(paths["rttm_path"]),
+                "turns": len(diarized_turns),
+            },
             elapsed=elapsed,
         )
 

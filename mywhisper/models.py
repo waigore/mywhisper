@@ -31,7 +31,11 @@ class PipelineEvent:
 
     stage: str
     message: str
+    step_name: Optional[str] = None
+    episode_id: Optional[str] = None
     payload: Dict[str, Any] = field(default_factory=dict)
+    artefact_paths: Dict[str, Path] = field(default_factory=dict)
+    checkpoint: Dict[str, Any] = field(default_factory=dict)
     elapsed: Optional[float] = None
 
 
@@ -43,6 +47,7 @@ class PodcastEpisode:
     show_title: str
     episode_title: str
     source_path: Path
+    description: Optional[str] = None
     duration_sec: Optional[float] = None
     published_at: Optional[_dt.datetime] = None
     author: Optional[str] = None

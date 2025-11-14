@@ -323,8 +323,20 @@ class TranscriptAssigner:
 
         yield PipelineEvent(
             stage="start",
+            step_name="assign",
+            episode_id=self.podcast.episode_id,
             message=f"Assigning speaker names for {self.podcast.episode_title}",
-            payload={"artefact_key": artefact_key, "segment_count": len(segments)},
+            payload={
+                "artefact_key": artefact_key,
+                "segment_count": len(segments),
+                "step": "started",
+            },
+            artefact_paths={"assignment": assignment_path},
+            checkpoint={
+                "status": "started",
+                "step": "assign",
+                "artefact_key": artefact_key,
+            },
             elapsed=0.0,
         )
 
@@ -338,8 +350,18 @@ class TranscriptAssigner:
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="profiles_ready",
+            step_name="assign",
+            episode_id=self.podcast.episode_id,
             message="Constructed speaker profiles",
-            payload={"profiles": len(profiles)},
+            payload={
+                "profiles": len(profiles),
+                "step": "profiles_ready",
+            },
+            checkpoint={
+                "status": "profiles_ready",
+                "step": "assign",
+                "artefact_key": artefact_key,
+            },
             elapsed=elapsed,
         )
 
@@ -370,8 +392,18 @@ class TranscriptAssigner:
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="inference_round",
+            step_name="assign",
+            episode_id=self.podcast.episode_id,
             message="Completed initial inference",
-            payload={"assignments": len(assignments)},
+            payload={
+                "assignments": len(assignments),
+                "step": "inference_round",
+            },
+            checkpoint={
+                "status": "inference_round",
+                "step": "assign",
+                "artefact_key": artefact_key,
+            },
             elapsed=elapsed,
         )
 
@@ -395,8 +427,18 @@ class TranscriptAssigner:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="refinement_round",
+                step_name="assign",
+                episode_id=self.podcast.episode_id,
                 message="Completed refinement inference",
-                payload={"assignments": len(refined_assignments)},
+                payload={
+                    "assignments": len(refined_assignments),
+                    "step": "refinement_round",
+                },
+                checkpoint={
+                    "status": "refinement_round",
+                    "step": "assign",
+                    "artefact_key": artefact_key,
+                },
                 elapsed=elapsed,
             )
 
@@ -422,15 +464,34 @@ class TranscriptAssigner:
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="persisted",
+            step_name="assign",
+            episode_id=self.podcast.episode_id,
             message="Persisted speaker assignments",
-            payload={"path": str(assignment_path), "segments": len(enriched_segments)},
+            payload={
+                "path": str(assignment_path),
+                "segments": len(enriched_segments),
+                "artefact_key": artefact_key,
+                "step": "completed",
+            },
+            artefact_paths={"assignment": assignment_path},
+            checkpoint={
+                "status": "completed",
+                "step": "assign",
+                "artefact_key": artefact_key,
+                "assignment_path": str(assignment_path),
+                "segments": len(enriched_segments),
+            },
             elapsed=elapsed,
         )
 
         return enriched_segments
 
     def _context_summary(self, metadata: Dict[str, str]) -> str:
-        description = metadata.get("description") or metadata.get("episode_description") or ""
+        description = (
+            metadata.get("description")
+            or metadata.get("episode_description")
+            or (self.podcast.description or "")
+        )
         published = metadata.get("published_at")
         summary_parts = [
             f"Show: {self.podcast.show_title}",

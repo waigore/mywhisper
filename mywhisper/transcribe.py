@@ -244,12 +244,21 @@ class PodcastTranscriber:
 
         yield PipelineEvent(
             stage="start",
+            step_name="transcribe",
+            episode_id=self.podcast.episode_id,
             message=f"Starting transcription for {self.podcast.episode_title}",
             payload={
                 "episode_id": self.podcast.episode_id,
                 "source": str(self.podcast.source_path),
                 "artefact_key": artefact_key,
+                "step": "started",
             },
+            checkpoint={
+                "status": "started",
+                "step": "transcribe",
+                "artefact_key": artefact_key,
+            },
+            artefact_paths={"transcript": transcript_path},
             elapsed=0.0,
         )
 
@@ -257,11 +266,22 @@ class PodcastTranscriber:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="chunk_prepared",
+                step_name="transcribe",
+                episode_id=self.podcast.episode_id,
                 message=f"Prepared chunk {idx}",
                 payload={
+                    "chunk_index": idx,
                     "chunk_path": str(chunk.path),
                     "start": chunk.global_start,
                     "end": chunk.global_end,
+                    "step": "chunk_prepared",
+                },
+                artefact_paths={"chunk": chunk.path},
+                checkpoint={
+                    "status": "chunk_prepared",
+                    "step": "transcribe",
+                    "chunk_index": idx,
+                    "artefact_key": artefact_key,
                 },
                 elapsed=elapsed,
             )
@@ -272,8 +292,20 @@ class PodcastTranscriber:
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
                 stage="chunk_transcribed",
+                step_name="transcribe",
+                episode_id=self.podcast.episode_id,
                 message=f"Transcribed chunk {idx}",
-                payload={"segment_count": len(chunk_segments)},
+                payload={
+                    "chunk_index": idx,
+                    "segment_count": len(chunk_segments),
+                    "step": "chunk_transcribed",
+                },
+                checkpoint={
+                    "status": "chunk_completed",
+                    "step": "transcribe",
+                    "chunk_index": idx,
+                    "artefact_key": artefact_key,
+                },
                 elapsed=elapsed,
             )
 
@@ -284,8 +316,23 @@ class PodcastTranscriber:
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="persisted",
+            step_name="transcribe",
+            episode_id=self.podcast.episode_id,
             message="Persisted transcript",
-            payload={"path": str(transcript_path), "segment_count": len(segments)},
+            payload={
+                "path": str(transcript_path),
+                "segment_count": len(segments),
+                "artefact_key": artefact_key,
+                "step": "completed",
+            },
+            artefact_paths={"transcript": transcript_path},
+            checkpoint={
+                "status": "completed",
+                "step": "transcribe",
+                "artefact_key": artefact_key,
+                "transcript_path": str(transcript_path),
+                "segment_count": len(segments),
+            },
             elapsed=elapsed,
         )
 
