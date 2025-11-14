@@ -1,0 +1,12 @@
+[run]
+omit =
+    mywhisper/myw/*
+    mywhisper/myw.py
+    mywhisper/config.py
+    mywhisper/myw/logging.py
+    mywhisper/myw/config.py
+    mywhisper/myw/messages.py
+    mywhisper/myw/models.py
+    mywhisper/myw/app.py
+    mywhisper/myw/myw.py
+
