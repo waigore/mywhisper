@@ -7,11 +7,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generator, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence, Tuple
 
 import json
 import logging
 from collections import defaultdict
+import re
 
 import requests
 import spacy
@@ -38,8 +39,8 @@ class AssignmentConfig:
     max_iterations: int = 2
     high_confidence_threshold: float = 0.7
     spacy_model: str = "en_core_web_sm"
-    sample_utterances_start: int = 3
-    sample_utterances_end: int = 3
+    sample_utterances_start: int = 50
+    sample_utterances_end: int = 50
     output_dir: Path = field(default_factory=lambda: ensure_data_subdir("transcripts"))
     data_root: Path = field(default_factory=resolve_data_root)
 
@@ -67,7 +68,9 @@ class SpeakerProfileBuilder:
     ) -> Dict[str, SpeakerProfile]:
         grouped: Dict[str, List[TranscriptSegment]] = defaultdict(list)
         for segment in segments:
-            speaker_id = segment.speaker_id or "UNKNOWN"
+            speaker_id = segment.speaker_id
+            if not speaker_id:
+                continue
             grouped[speaker_id].append(segment)
 
         profiles: Dict[str, SpeakerProfile] = {}
@@ -245,12 +248,13 @@ class SpeakerInferenceEngine:
             f"Speaker Evidence:\n{speaker_section}\n"
         )
 
+    _UNQUOTED_SPEAKER_ID = re.compile(r'("speaker_id"\s*:\s*)([A-Za-z0-9_:-]+)(\s*[,}])')
+
     def _parse_assignments(self, raw_output: str) -> List[SpeakerAssignment]:
-        raw_output = raw_output.strip()
-        try:
-            data = json.loads(raw_output)
-        except json.JSONDecodeError:
-            self.logger.error("Failed to parse LLM output: %s", raw_output)
+        payload = self._strip_code_fences(raw_output.strip())
+        data = self._loads_with_recovery(payload)
+        if data is None:
+            self.logger.error("Failed to parse LLM output: %s", payload)
             return []
 
         assignments: List[SpeakerAssignment] = []
@@ -267,6 +271,37 @@ class SpeakerInferenceEngine:
             except (TypeError, ValueError, KeyError) as exc:
                 self.logger.warning("Skipping malformed assignment %s: %s", item, exc)
         return assignments
+
+    def _strip_code_fences(self, text: str) -> str:
+        if not text.startswith("```"):
+            return text
+        lines = text.splitlines()
+        if lines:
+            lines.pop(0)
+        while lines and lines[-1].strip().startswith("```"):
+            lines.pop()
+        return "\n".join(lines).strip()
+
+    def _loads_with_recovery(self, payload: str) -> Optional[Any]:
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            repaired = self._repair_unquoted_identifiers(payload)
+            if repaired != payload:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    def _repair_unquoted_identifiers(self, payload: str) -> str:
+        def repl(match: "re.Match[str]") -> str:  # type: ignore[name-defined]
+            prefix, value, suffix = match.groups()
+            if value.startswith('"') and value.endswith('"'):
+                return match.group(0)
+            return f'{prefix}"{value.strip()}"{suffix}'
+
+        return self._UNQUOTED_SPEAKER_ID.sub(repl, payload)
 
 
 class TranscriptAssigner:
@@ -325,6 +360,13 @@ class TranscriptAssigner:
         episode_key = self.podcast.episode_key
         assignment_path = self.config.assignment_path(self.podcast, episode_key)
         start_time = time.perf_counter()
+        self.logger.info(
+            "Speaker assignment started | episode=%s | segments=%d | metadata_keys=%s | config=%s",
+            self.podcast.episode_id,
+            len(segments),
+            sorted(metadata.keys()),
+            self._config_snapshot(),
+        )
 
         yield PipelineEvent(
             stage="start",
@@ -352,6 +394,11 @@ class TranscriptAssigner:
             segments,
             sample_start=self.config.sample_utterances_start,
             sample_end=self.config.sample_utterances_end,
+        )
+        self.logger.info(
+            "Constructed %d speaker profiles: %s",
+            len(profiles),
+            sorted(profiles.keys()),
         )
 
         elapsed = time.perf_counter() - start_time
@@ -382,6 +429,13 @@ class TranscriptAssigner:
         else:
             extra_iterable = additional or []
         roster = roster_builder.compile(self.podcast, list(extra_iterable))
+        roster_sample = roster[:15]
+        roster_log = roster_sample + (["..."] if len(roster) > len(roster_sample) else [])
+        self.logger.info(
+            "Candidate roster size=%d sample=%s",
+            len(roster),
+            roster_log,
+        )
 
         context_summary = self._context_summary(combined_metadata)
         target_speakers = list(profiles.keys())
@@ -396,6 +450,10 @@ class TranscriptAssigner:
         )
         assignment_map = self.inference_engine.consolidate({}, assignments)
         critic_flags = self.inference_engine.critic(list(assignment_map.values()))
+        self.logger.info(
+            "Inference assignments: %s",
+            self._assignment_snapshot(assignments),
+        )
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
@@ -432,6 +490,10 @@ class TranscriptAssigner:
             )
             assignment_map = self.inference_engine.consolidate(assignment_map, refined_assignments)
             critic_flags = self.inference_engine.critic(list(assignment_map.values()))
+            self.logger.info(
+                "Refinement assignments: %s",
+                self._assignment_snapshot(refined_assignments),
+            )
 
             elapsed = time.perf_counter() - start_time
             yield PipelineEvent(
@@ -465,12 +527,26 @@ class TranscriptAssigner:
                     confidence=assignment.confidence,
                     justification=assignment.justification,
                 )
+        self.logger.info(
+            "Final speaker assignments: %s",
+            self._assignment_snapshot(final_assignments.values()),
+        )
 
         enriched_segments = self._label_segments(segments, final_assignments)
         self._persist_assignments(assignment_path, enriched_segments)
         self._last_assignment_path = assignment_path
         self._last_episode_key = episode_key
         self._last_artefact_key = episode_key
+        named_segments = sum(
+            1 for seg in enriched_segments if seg.speaker_name and seg.speaker_name.strip().upper() != "UNKNOWN"
+        )
+        self.logger.info(
+            "Persisted assignments | path=%s | segments=%d | named=%d | unknown=%d",
+            assignment_path,
+            len(enriched_segments),
+            named_segments,
+            len(enriched_segments) - named_segments,
+        )
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
@@ -498,6 +574,35 @@ class TranscriptAssigner:
         )
 
         return enriched_segments
+
+    def _config_snapshot(self) -> Dict[str, Any]:
+        return {
+            "ollama_model": self.config.ollama_model,
+            "max_iterations": self.config.max_iterations,
+            "high_confidence_threshold": self.config.high_confidence_threshold,
+            "spacy_model": self.config.spacy_model,
+            "sample_range": (
+                self.config.sample_utterances_start,
+                self.config.sample_utterances_end,
+            ),
+            "output_dir": str(self.config.output_dir),
+            "data_root": str(self.config.data_root),
+        }
+
+    def _assignment_snapshot(
+        self,
+        assignments: Iterable[SpeakerAssignment],
+    ) -> List[Dict[str, Any]]:
+        snapshot: List[Dict[str, Any]] = []
+        for assignment in assignments:
+            snapshot.append(
+                {
+                    "speaker_id": assignment.speaker_id,
+                    "name": assignment.proposed_name,
+                    "confidence": round(assignment.confidence, 3),
+                }
+            )
+        return snapshot
 
     def _context_summary(self, metadata: Dict[str, str]) -> str:
         description = (
@@ -545,6 +650,7 @@ class TranscriptAssigner:
                 "end": seg.end,
                 "text": seg.text,
                 "speaker": seg.speaker_id,
+                "speaker_id": seg.speaker_id,
                 "speaker_name": seg.speaker_name,
                 "confidence": seg.confidence,
                 "justification": seg.justification,

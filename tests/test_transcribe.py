@@ -38,7 +38,7 @@ class FakeModel:
     def __init__(self) -> None:
         self.calls: List[float] = []
 
-    def transcribe(self, audio_np, language: str):
+    def transcribe(self, audio_np, language: str, new_segment_callback=None):
         self.calls.append(float(audio_np.sum()))
 
         class Segment:
@@ -47,12 +47,15 @@ class FakeModel:
                 self.t1 = t1
                 self.text = text
 
-        return [Segment(0.0, 200.0, "Hello world")]
+        segment = Segment(0.0, 200.0, "Hello world")
+        if new_segment_callback:
+            new_segment_callback(segment)
+        return [segment]
 
 
 class StubTranscriber(PodcastTranscriber):
-    def _transcribe_chunk(self, chunk: AudioChunk) -> List[TranscriptSegment]:
-        return super()._transcribe_chunk(chunk)
+    def _transcribe_chunk(self, chunk: AudioChunk, chunk_index: int):
+        return (yield from super()._transcribe_chunk(chunk, chunk_index))
 
 
 class StubChunker:
@@ -129,6 +132,7 @@ def test_transcribe_generator_yields_events(tmp_path, monkeypatch):
     stages = [event.stage for event in generator]
     assert stages[0] == "start"
     assert "persisted" in stages
+    assert "segment_detected" in stages
 
 
 def test_load_cached_segments(tmp_path, monkeypatch):

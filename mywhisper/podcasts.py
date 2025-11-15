@@ -4,6 +4,7 @@ Podcast catalog management for mywhisper.
 
 from __future__ import annotations
 
+import filecmp
 import json
 import plistlib
 import re
@@ -511,6 +512,18 @@ class ApplePodcastsImporter:
             filename_parts.append(f"({ _sanitize(media.author) })")
 
         base_name = " - ".join(filename_parts) if filename_parts else _sanitize(media.audio_path.stem)
+        preferred_path = destination_dir / f"{base_name}{media.audio_path.suffix}"
+
+        if not self.move and preferred_path.exists():
+            try:
+                already_present = filecmp.cmp(preferred_path, media.audio_path, shallow=False)
+            except OSError as exc:  # pragma: no cover - best effort
+                already_present = False
+                self.logger.debug("Unable to compare %s and %s: %s", media.audio_path, preferred_path, exc)
+            if already_present:
+                self.logger.debug("Skipping copy for %s, already present at %s", media.audio_path, preferred_path)
+                return preferred_path
+
         dest_path = self._unique_destination(destination_dir, base_name, media.audio_path.suffix)
 
         if self.move:

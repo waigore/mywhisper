@@ -98,45 +98,34 @@ Tests live under `tests/` mirroring the package structure.
 ### `mywhisper/diarize`
 
 #### Responsibilities
-- Chunk long-form audio for diarization while reusing existing chunk exports when possible.
-- Run PyAnnote speaker diarization pipeline with configurable speaker counts.
-- Extract speaker embeddings, cluster into consistent global speaker IDs, and publish RTTM plus JSON transcripts.
+- Run the PyAnnote speaker diarization pipeline end-to-end on the full source audio.
+- Surface PyAnnote progress updates via `pyannote.audio.pipelines.utils.hook.ProgressHook`.
+- Normalize audio loading and resampling so the pipeline always receives a mono waveform tensor.
+- Persist RTTM (and optional JSON transcripts) under the standard `data/transcripts` layout.
 
 #### Key Classes
 - `DiarizationConfig`
-  - Fields: `hf_token`, `num_speakers`, `chunk_minutes`, `overlap_seconds`, `embedding_window`, `output_dir`, `device`.
-  - Provides `auth()` helper to call `huggingface_hub.login`.
+  - Fields: `hf_token`, `num_speakers`, `device`, `output_dir`, `rttm_dir`, `target_sample_rate`.
+  - Provides `progress_hook_factory` (defaults to `TqdmProgressHook`) so callers can override UI integration.
 
-- `ChunkScheduler`
-  - `schedule(podcast: PodcastEpisode) -> Generator[AudioChunk, None, None]`
-  - Reuses existing chunk files in `data/audio_chunks/{podcast_slug}/`.
-  - Emits events describing `global_start`, `global_end`, `path`.
+- `WaveformLoader`
+  - Static method `load(path: Path, target_sample_rate: int) -> dict[str, torch.Tensor | int]`.
+  - Uses `torchaudio.load`, resamples when needed, and downmixes stereo to mono.
 
 - `PyAnnotePipelineFactory`
-  - Static methods to create `Pipeline` and `Inference` instances (embedding extractor).
-  - Handles moving models to `config.device`.
-
-- `SpeakerClusterer`
-  - Maintains reference embeddings (`joblib` persistence to `data/transcripts/{podcast_slug}/{episode_key}_clusters.pkl`).
-  - Methods: `fit_reference(chunk: AudioChunk, annotation: Annotation) -> None`, `assign(embeddings: np.ndarray) -> np.ndarray` (returns speaker ids), `save/load`.
+  - Static `create_pipeline(config: DiarizationConfig) -> Pipeline`.
+  - Applies HuggingFace auth token and moves the pipeline to `config.device` when provided.
 
 - `DiarizationPipeline`
-  - Constructor parameters: `podcast`, `config`, `chunk_scheduler`, `pipeline`, `embedding_inference`, `clusterer`.
-  - `from_config(...)` builds dependencies, optionally seeding reference chunk (first chunk).
-  - `run(yield_progress: bool = False)` generator with stages:
-    1. `chunk_started`
-    2. `local_annotation_ready`
-    3. `embeddings_extracted`
-    4. `cluster_assignment`
-    5. `segment_committed`
-  - Aggregates `pyannote.core.Annotation` into global annotation, stores RTTM under `data/transcripts/rttm/{podcast_slug}_{episode_key}.rttm`.
-  - Returns structured diarization results: `list[DiarizedTurn]` where `DiarizedTurn` includes `start`, `end`, `speaker_id`.
-  - Exposes `write_json_transcript(target: Path, transcript: list[TranscriptSegment])` to combine with raw transcript (keeping `speaker_id` placeholders).
+  - Constructor parameters: `podcast`, `config`, `pipeline`, `waveform_loader`, optional `ProgressHook`.
+  - `from_config(...)` instantiates the pipeline and hook factory.
+  - `run(progress: bool = True) -> list[DiarizedTurn]` wraps `pipeline(...)`, passing the waveform dict and hook.
+  - Aggregates the resulting `pyannote.core.Annotation`, writes RTTM to `data/transcripts/rttm/{slug}_{episode_key}.rttm`, and returns diarized turns sorted by start time.
+  - `write_json_transcript(...)` unchanged: converts `TranscriptSegment` objects into a JSON payload compatible with downstream speaker assignment.
 
--#### Artefacts
-- Chunk WAV files: `data/audio_chunks/{podcast_slug}/{episode_key}/chunk_{idx:03d}.wav`.
-- Cluster cache: `data/transcripts/{podcast_slug}/{episode_key}_clusters.pkl`.
-- Diarization JSON (optional) mirrors `whisper_diarization.json`.
+#### Artefacts
+- RTTM files only: `{slug}_{episode_key}.rttm` under `data/transcripts/rttm/`.
+- Optional diarization JSON mirroring `examples/diarize_audio_4_0_0.py` output when `write_json_transcript` is invoked.
 
 ---
 

@@ -155,3 +155,62 @@ def test_inference_engine_prompt_and_parse():
     merged = engine.consolidate({}, assignments)
     assert "SPEAKER_00" in merged
 
+
+def test_inference_engine_recovers_unquoted_speaker_ids():
+    config = AssignmentConfig()
+    engine = SpeakerInferenceEngine(config, client=None)  # type: ignore[arg-type]
+    raw = """
+    [
+      {
+        "speaker_id": SPEAKER_03,
+        "proposed_name": "Pomp",
+        "confidence": 1.0,
+        "justification": "Host introduction"
+      }
+    ]
+    """
+    assignments = engine._parse_assignments(raw)
+    assert assignments and assignments[0].speaker_id == "SPEAKER_03"
+
+
+def test_assignment_snapshots(tmp_path):
+    config = AssignmentConfig(
+        data_root=tmp_path / "data",
+        ollama_model="llama3",
+        spacy_model="en_core_web_sm",
+        sample_utterances_start=2,
+        sample_utterances_end=4,
+    )
+    episode = PodcastEpisode(
+        episode_id="ep-2",
+        show_title="Snapshot Show",
+        episode_title="Snapshot Episode",
+        source_path=tmp_path / "audio.wav",
+    )
+    engine = StubEngine(
+        assignments=[
+            SpeakerAssignment(speaker_id="S0", proposed_name="Alex", confidence=0.7),
+        ]
+    )
+    assigner = TranscriptAssigner(
+        podcast=episode,
+        config=config,
+        inference_engine=engine,
+    )
+
+    config_snapshot = assigner._config_snapshot()
+    assert config_snapshot["ollama_model"] == "llama3"
+    assert config_snapshot["sample_range"] == (2, 4)
+    assert config_snapshot["data_root"] == str(config.data_root)
+
+    assignment_snapshot = assigner._assignment_snapshot(
+        [
+            SpeakerAssignment(speaker_id="S0", proposed_name="Host", confidence=0.91),
+            SpeakerAssignment(speaker_id="S1", proposed_name="Guest", confidence=0.42),
+        ]
+    )
+    assert assignment_snapshot == [
+        {"speaker_id": "S0", "name": "Host", "confidence": 0.91},
+        {"speaker_id": "S1", "name": "Guest", "confidence": 0.42},
+    ]
+

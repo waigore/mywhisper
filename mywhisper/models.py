@@ -37,6 +37,7 @@ class PipelineEvent:
     artefact_paths: Dict[str, Path] = field(default_factory=dict)
     checkpoint: Dict[str, Any] = field(default_factory=dict)
     elapsed: Optional[float] = None
+    transient: bool = False
 
 
 @dataclass(slots=True)

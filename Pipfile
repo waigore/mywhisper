@@ -4,18 +4,20 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-torch = "2.3.1"
-torchaudio = "2.3.1"
+torch = ">=2.3.1"
+torchaudio = ">=2.3.1"
 matplotlib = "*"
 pywhispercpp = "*"
 transformers = ">=4.39"
 "huggingface-hub" = ">=0.34,<1.0"
-"pyannote.audio" = "*"
+"pyannote.audio" = ">=4.0.0"
 ollama = "*"
 pydub = "*"
 spacy = "*"
 textual = "*"
 dotenv = "*"
+librosa = "*"
+omegaconf = "*"
 
 [dev-packages]
 pytest = "*"

@@ -143,6 +143,12 @@ mywhisper/myw/
     - `stop_current` sets stop flag; runner checks between steps, gracefully cancels, marks `Stopped`, writes checkpoint metadata and ensures step outputs remain accessible.
   - Supports resume:
     - Runner reads checkpoint data from `myw.db`, verifies intermediate outputs exist, skips finished steps, restarts next pending step.
+- Partial execution:
+  - Every `QueueItem` carries a `step_plan` describing which subset of the canonical steps should run for that invocation; default plan contains all steps in canonical order.
+  - Runner iterates only the steps present in the plan, skipping the rest without surfacing errors.
+  - Diarization-only runs require a cached transcript; assignment-only runs require both transcript and diarization checkpoints. The runner validates prerequisites up front and surfaces actionable errors when inputs are missing.
+  - Progress percentages scale relative to the number of planned steps so the UI still shows `0 → 100%` even when skipping phases.
+  - Completed plan metadata is persisted alongside checkpoints so the queue can resume remaining steps later or prevent duplicate work.
 - Thread Safety:
   - Use `threading.Lock` for shared state (statuses, queue list).
   - Use `Queue` or `deque` + `Condition`.
@@ -175,4 +181,22 @@ mywhisper/myw/
 - Queue persistence can later move to SQLite without breaking UI by swapping `QueueController`.
 - Additional pipeline steps should extend a simple step registry consumed by `PipelineRunner`.
 - Provide hooks for publishing events to external observers (e.g., WebSocket, notifications) via message bus wrapper.
+
+## Conversational CLI (`mywconv.py`)
+
+- Purpose: lightweight guided CLI for running the pipeline without the Textual UI.
+- Flow:
+  1. Load config/logging, sync catalog, and list available episodes (existing behaviour).
+  2. Prompt the user to pick an episode by index or `episode_id`.
+  3. Immediately after selection, present a pipeline scope menu:
+     - `Full pipeline` (transcribe → diarize → assign).
+     - `Transcription only`.
+     - `Diarization only` (requires previously stored transcript; warn/abort if missing).
+  4. Checkpoint awareness:
+     - If the selected episode already has completed checkpoints for any of the requested steps, prompt the user to resume from the next pending step or restart from scratch (default to restart).
+     - Resuming preserves completed checkpoints; restarting wipes the episode’s checkpoints before enqueuing.
+  5. Translate the final choice into a `step_plan` and pass it to `QueueController.enqueue(...)` so the runner knows which steps to execute.
+  5. Stream progress via `PipelineMonitor` exactly as today; completion status message reflects the chosen scope (e.g., “Transcription complete”).
+  6. Exit with `0` on success, `2` when the pipeline stops or prerequisites fail.
+- Future enhancements (out of scope now) can add assignment-only or resume-from-checkpoint options following the same menu pattern.
 

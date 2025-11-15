@@ -5,7 +5,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Optional, Sequence
 
 from ..models import PipelineStatus
 
@@ -18,6 +18,7 @@ class QueueItem:
     episode_id: str
     resume: bool = False
     ready_at: float = 0.0
+    steps: Optional[tuple[str, ...]] = None
 
 
 class QueueController:
@@ -39,7 +40,12 @@ class QueueController:
         with self._lock:
             return dict(self._statuses)
 
-    def enqueue(self, episode_id: str, resume: bool = False) -> None:
+    def enqueue(
+        self,
+        episode_id: str,
+        resume: bool = False,
+        steps: Optional[Sequence[str]] = None,
+    ) -> None:
         with self._condition:
             if any(item.episode_id == episode_id for item in self._queue):
                 LOGGER.debug("Episode %s already queued", episode_id)
@@ -49,7 +55,15 @@ class QueueController:
                 return
             delay = 0.0 if resume else self._enqueue_delay
             ready_at = time.monotonic() + delay
-            self._queue.append(QueueItem(episode_id=episode_id, resume=resume, ready_at=ready_at))
+            normalized_steps = tuple(steps) if steps else None
+            self._queue.append(
+                QueueItem(
+                    episode_id=episode_id,
+                    resume=resume,
+                    ready_at=ready_at,
+                    steps=normalized_steps,
+                )
+            )
             self._statuses.setdefault(episode_id, ("Downloaded", ""))
             LOGGER.info("Enqueued episode %s (resume=%s)", episode_id, resume)
             self._condition.notify()
@@ -60,12 +74,21 @@ class QueueController:
                 self._stop_requested = True
                 LOGGER.info("Stop requested for episode %s", self._current.episode_id)
 
-    def resume_episode(self, episode_id: str) -> None:
+    def resume_episode(
+        self,
+        episode_id: str,
+        steps: Optional[Sequence[str]] = None,
+    ) -> None:
         with self._condition:
             if any(item.episode_id == episode_id for item in self._queue):
                 return
             self._queue.appendleft(
-                QueueItem(episode_id=episode_id, resume=True, ready_at=time.monotonic())
+                QueueItem(
+                    episode_id=episode_id,
+                    resume=True,
+                    ready_at=time.monotonic(),
+                    steps=tuple(steps) if steps else None,
+                )
             )
             self._statuses[episode_id] = ("In progress", "Resuming")
             self._stop_requested = False

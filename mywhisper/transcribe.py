@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 from dataclasses import dataclass, field
+from queue import SimpleQueue
 from pathlib import Path
-from typing import Generator, Iterable, List, Optional, Sequence
+from typing import Any, Generator, Iterable, List, Optional, Sequence
 
 import logging
 
@@ -71,7 +73,7 @@ class WhisperModelFactory:
         if Model is object:
             raise RuntimeError("pywhispercpp is not available in this environment.")
         LOGGER.debug("Loading Whisper model from %s", config.model_path)
-        return Model(str(config.model_path), language=config.language)
+        return Model(str(config.model_path), language=config.language, print_realtime=False)
 
 
 class AudioChunker:
@@ -308,7 +310,7 @@ class PodcastTranscriber:
                 elapsed=elapsed,
             )
 
-            chunk_segments = self._transcribe_chunk(chunk)
+            chunk_segments = yield from self._transcribe_chunk(chunk, idx)
             segments.extend(chunk_segments)
 
             elapsed = time.perf_counter() - start_time
@@ -364,7 +366,11 @@ class PodcastTranscriber:
 
         return segments
 
-    def _transcribe_chunk(self, chunk: AudioChunk) -> List[TranscriptSegment]:
+    def _transcribe_chunk(
+        self,
+        chunk: AudioChunk,
+        chunk_index: int,
+    ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
         if not hasattr(self.model, "transcribe"):
             raise RuntimeError("Whisper model does not implement `transcribe`.")
 
@@ -380,8 +386,72 @@ class PodcastTranscriber:
             tensor = tensor.squeeze(0)
         audio_np = tensor.detach().cpu().numpy().astype("float32", copy=False)
 
-        whisper_segments = self.model.transcribe(audio_np, language=self.config.language)
+        segment_queue: SimpleQueue = SimpleQueue()
+        result_holder: dict[str, Any] = {}
+        error_holder: dict[str, BaseException] = {}
 
+        def enqueue_segment(segment: Any) -> None:
+            segment_queue.put(segment)
+
+        def worker() -> None:
+            try:
+                result_holder["segments"] = self.model.transcribe(
+                    audio_np,
+                    language=self.config.language,
+                    new_segment_callback=enqueue_segment,
+                )
+            except BaseException as exc:  # pragma: no cover - defensive
+                error_holder["error"] = exc
+            finally:
+                segment_queue.put(None)
+
+        worker_thread = threading.Thread(
+            target=worker,
+            name=f"whisper-segment-{chunk_index}",
+            daemon=True,
+        )
+        worker_thread.start()
+
+        segment_counter = 0
+        while True:
+            segment = segment_queue.get()
+            if segment is None:
+                break
+
+            text = str(getattr(segment, "text", "")).strip()
+            preview = text if len(text) <= 80 else f"{text[:77]}..."
+            start_seconds = (float(getattr(segment, "t0", 0.0)) / WHISPER_TIME_FACTOR) + chunk.global_start
+            end_seconds = (float(getattr(segment, "t1", 0.0)) / WHISPER_TIME_FACTOR) + chunk.global_start
+            end_seconds = max(start_seconds, end_seconds)
+
+            yield PipelineEvent(
+                stage="segment_detected",
+                step_name="transcribe",
+                episode_id=self.podcast.episode_id,
+                message=f"Chunk {chunk_index} segment {segment_counter + 1}: {preview or '[silence]'}",
+                payload={
+                    "chunk_index": chunk_index,
+                    "segment_index": segment_counter,
+                    "start": start_seconds,
+                    "end": end_seconds,
+                    "text": text,
+                    "step": "segment_detected",
+                },
+                checkpoint={
+                    "status": "in_progress",
+                    "step": "transcribe",
+                    "chunk_index": chunk_index,
+                    "segment_index": segment_counter,
+                },
+                transient=True,
+            )
+            segment_counter += 1
+
+        worker_thread.join()
+        if "error" in error_holder:
+            raise error_holder["error"]
+
+        whisper_segments = result_holder.get("segments") or []
         normalized: List[TranscriptSegment] = []
         for seg in whisper_segments:
             start_seconds = (seg.t0 / WHISPER_TIME_FACTOR) + chunk.global_start
