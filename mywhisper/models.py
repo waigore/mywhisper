@@ -20,6 +20,7 @@ __all__ = [
     "TranscriptSegment",
     "SpeakerProfile",
     "SpeakerAssignment",
+    "SpeakerNameGuesses",
     "AudioChunk",
     "DiarizedTurn",
 ]
@@ -158,6 +159,42 @@ class SpeakerAssignment:
 
     def is_high_confidence(self, threshold: float) -> bool:
         return self.confidence >= threshold
+
+
+@dataclass(slots=True)
+class SpeakerNameGuesses:
+    """Container for per-speaker name proposals."""
+
+    speaker_id: str
+    proposed_names: List[SpeakerAssignment] = field(default_factory=list)
+
+    def add_proposal(self, proposal: SpeakerAssignment) -> None:
+        """
+        Add or merge a name proposal for this speaker, keeping the highest-confidence
+        instance per normalized name and maintaining descending confidence order.
+        """
+
+        normalized = proposal.proposed_name.strip().lower()
+        existing_index = next(
+            (
+                idx
+                for idx, candidate in enumerate(self.proposed_names)
+                if candidate.proposed_name.strip().lower() == normalized
+            ),
+            None,
+        )
+        if existing_index is not None:
+            if proposal.confidence > self.proposed_names[existing_index].confidence:
+                self.proposed_names[existing_index] = proposal
+        else:
+            self.proposed_names.append(proposal)
+
+        self.proposed_names.sort(key=lambda candidate: candidate.confidence, reverse=True)
+
+    def best(self) -> Optional[SpeakerAssignment]:
+        """Return the highest-confidence proposal, if any."""
+
+        return self.proposed_names[0] if self.proposed_names else None
 
 
 @dataclass(slots=True)

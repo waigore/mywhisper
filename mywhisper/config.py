@@ -32,6 +32,37 @@ def ensure_data_subdir(name: str, root: Optional[Path] = None) -> Path:
     return target
 
 
+def ensure_episode_subdir(
+    episode_key: str,
+    root: Optional[Path] = None,
+    parent: str = "transcripts",
+) -> Path:
+    """
+    Ensure the per-episode transcript directory exists.
+
+    Parameters
+    ----------
+    episode_key:
+        The deterministic eight-character key identifying the episode.
+    root:
+        Optional override for the base data directory.
+    parent:
+        Relative subdirectory under the data root where transcript folders live.
+    """
+
+    if not episode_key:
+        raise ValueError("episode_key must be provided.")
+
+    normalized = episode_key.strip()
+    if not normalized:
+        raise ValueError("episode_key must not be empty or whitespace.")
+
+    parent_dir = ensure_data_subdir(parent, root)
+    target = parent_dir / normalized
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def generate_artefact_key() -> str:
     """
     Generate an eight-character artefact key for temporary files.

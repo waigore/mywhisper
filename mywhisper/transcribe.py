@@ -14,7 +14,7 @@ from typing import Any, Generator, Iterable, List, Optional, Sequence
 
 import logging
 
-from .config import ensure_data_subdir, resolve_data_root
+from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
 from .models import AudioChunk, PipelineEvent, PodcastEpisode, TranscriptSegment
 
 import torch
@@ -49,9 +49,8 @@ class TranscriptionConfig:
         episode_key: Optional[str] = None,
     ) -> Path:
         key = episode_key or podcast.episode_key
-        slug = podcast.artefact_slug()
-        target_dir = ensure_data_subdir(f"transcripts/{slug}", self.data_root)
-        return target_dir / f"{key}_whisper.json"
+        episode_dir = ensure_episode_subdir(key, self.data_root, "transcripts")
+        return episode_dir / f"{key}_whisper.json"
 
     def chunk_dir(
         self,

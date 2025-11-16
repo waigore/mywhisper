@@ -4,11 +4,8 @@ Podcast catalog management for mywhisper.
 
 from __future__ import annotations
 
-import filecmp
 import json
 import plistlib
-import re
-import shutil
 import logging
 import sqlite3
 import subprocess
@@ -20,7 +17,6 @@ from functools import lru_cache
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple
 
 from .config import ensure_data_subdir, resolve_data_root
-from .config import generate_artefact_key
 from .models import PodcastEpisode
 
 LOGGER = logging.getLogger("mywhisper.podcasts")
@@ -55,10 +51,6 @@ CREATE INDEX IF NOT EXISTS idx_episodes_published_at ON episodes(published_at);
 
 
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".aac", ".wav", ".mp4"}
-
-
-def _sanitize(text: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]+', "_", text.strip())
 
 
 def _to_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -179,8 +171,11 @@ class PodcastCatalog:
         data_root: Optional[Path] = None,
     ) -> None:
         self.data_root = resolve_data_root(data_root)
-        catalog_dir = ensure_data_subdir("podcasts", self.data_root)
-        self.db_path = (db_path or catalog_dir / "catalog.db").resolve()
+        self.data_root.mkdir(parents=True, exist_ok=True)
+
+        resolved_db_path = (db_path or self.data_root / "catalog.db")
+        self.db_path = resolved_db_path.expanduser().resolve()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -360,10 +355,17 @@ class ApplePodcastsImporter:
         logger: Optional[logging.Logger] = None,
         db_path: Optional[Path] = None,
     ) -> None:
+        if output_dir is not None:
+            raise ValueError(
+                "ApplePodcastsImporter no longer copies audio files; "
+                "output_dir is unsupported because episodes stream directly from the Podcasts cache."
+            )
+        if move:
+            raise ValueError(
+                "ApplePodcastsImporter cannot move cache files; episodes stay in place to satisfy the spec."
+            )
         self.cache_root = cache_root
         self.catalog = catalog
-        self.output_dir = (output_dir or ensure_data_subdir("podcasts")).resolve()
-        self.move = move
         self.logger = logger or LOGGER
         self.db_path = db_path
 
@@ -379,36 +381,30 @@ class ApplePodcastsImporter:
 
     def register_in_catalog(self) -> Generator[PodcastEpisode, None, None]:
         for metadata in self.scan():
-            try:
-                dest_path = self._copy_episode(media=metadata)
-            except Exception as exc:
-                self.logger.error("Failed to copy %s: %s", metadata.audio_path, exc)
+            audio_path = metadata.audio_path
+            if not audio_path.exists():
+                self.logger.warning(
+                    "Skipping %s because audio file %s is missing",
+                    metadata.cache_entry,
+                    audio_path,
+                )
                 continue
 
             episode = metadata.to_episode()
-            episode.source_path = dest_path
-            duration = self._duration_seconds(dest_path)
+            episode.source_path = audio_path.resolve()
+
+            duration = self._duration_seconds(episode.source_path)
             if duration:
                 episode.duration_sec = duration
 
             episode.metadata.update(
                 {
-                    "original_cache_path": str(metadata.audio_path),
+                    "original_cache_path": str(episode.source_path),
                     "imported_at": datetime.utcnow().isoformat(),
                 }
             )
 
             self.catalog.upsert_episode(episode)
-            artefact_key = generate_artefact_key()
-            self.catalog.record_artefact(
-                episode_id=episode.episode_id,
-                kind="audio",
-                path=dest_path,
-                artefact_key=artefact_key,
-            )
-
-            if self.move:
-                self._cleanup_source(metadata.cache_entry)
 
             yield episode
 
@@ -500,47 +496,6 @@ class ApplePodcastsImporter:
             extra=extra,
         )
 
-    def _copy_episode(self, media: EpisodeMetadata) -> Path:
-        destination_dir = self.output_dir / _sanitize(media.show_title or "Unknown Show")
-        destination_dir.mkdir(parents=True, exist_ok=True)
-
-        published_part = (
-            media.published_at.strftime("%Y-%m-%d") if media.published_at else ""
-        )
-        filename_parts = [part for part in [published_part, _sanitize(media.episode_title)] if part]
-        if media.author:
-            filename_parts.append(f"({ _sanitize(media.author) })")
-
-        base_name = " - ".join(filename_parts) if filename_parts else _sanitize(media.audio_path.stem)
-        preferred_path = destination_dir / f"{base_name}{media.audio_path.suffix}"
-
-        if not self.move and preferred_path.exists():
-            try:
-                already_present = filecmp.cmp(preferred_path, media.audio_path, shallow=False)
-            except OSError as exc:  # pragma: no cover - best effort
-                already_present = False
-                self.logger.debug("Unable to compare %s and %s: %s", media.audio_path, preferred_path, exc)
-            if already_present:
-                self.logger.debug("Skipping copy for %s, already present at %s", media.audio_path, preferred_path)
-                return preferred_path
-
-        dest_path = self._unique_destination(destination_dir, base_name, media.audio_path.suffix)
-
-        if self.move:
-            shutil.move(str(media.audio_path), str(dest_path))
-        else:
-            shutil.copy2(media.audio_path, dest_path)
-
-        return dest_path
-
-    def _unique_destination(self, directory: Path, base_name: str, suffix: str) -> Path:
-        counter = 0
-        candidate = directory / f"{base_name}{suffix}"
-        while candidate.exists():
-            counter += 1
-            candidate = directory / f"{base_name} ({counter}){suffix}"
-        return candidate
-
     def _duration_seconds(self, audio_path: Path) -> Optional[float]:
         try:
             import torchaudio  # type: ignore
@@ -554,12 +509,6 @@ class ApplePodcastsImporter:
         if not info.num_frames or not info.sample_rate:
             return None
         return info.num_frames / info.sample_rate
-
-    def _cleanup_source(self, path: Path) -> None:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-        elif path.exists():
-            path.unlink(missing_ok=True)
 
     def _find_audio_file(self, entry: Path) -> Optional[Path]:
         if entry.is_file() and entry.suffix.lower() in AUDIO_EXTENSIONS:

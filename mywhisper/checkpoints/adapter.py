@@ -16,9 +16,11 @@ class PipelineEventAdapter:
         self,
         store: CheckpointStore,
         episode_id: Optional[str] = None,
+        pipeline_id: Optional[str] = None,
     ) -> None:
         self.store = store
         self._episode_id = episode_id
+        self._pipeline_id = pipeline_id
 
     def process(self, event: PipelineEvent) -> PipelineCheckpoint:
         episode_id = event.episode_id or self._episode_id
@@ -29,6 +31,7 @@ class PipelineEventAdapter:
         status = (event.checkpoint or {}).get("status") or event.stage
 
         checkpoint = PipelineCheckpoint(
+            pipeline_id=self._pipeline_id,
             episode_id=episode_id,
             step=step,
             status=status,

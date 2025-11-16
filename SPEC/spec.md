@@ -1,246 +1,116 @@
-## MyWhisper Module Specification
+## MyWhisper Specification
 
 ### Purpose
-`mywhisper` provides reproducible pipelines for podcast transcription, speaker diarization, and speaker identity inference, backed by a lightweight catalog of locally cached podcast episodes. The module targets batch and interactive usage, emphasizing reuse of raw audio without duplication, predictable temporary artefact layout, and composable, generator-driven pipelines.
+`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → label speakers → prettify → thematize) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
 
 ---
 
 ### Package Layout
-- `mywhisper/__init__.py` — package exports, logging bootstrap.
-- `mywhisper/transcribe.py` — transcription pipeline classes.
-- `mywhisper/diarize.py` — diarization and speaker clustering pipelines.
-- `mywhisper/assign.py` — speaker name inference and transcript enrichment.
-- `mywhisper/podcasts.py` — catalog of Apple Podcasts cache episodes.
-- `mywhisper/config.py` (optional) — shared configuration helpers (e.g. data directories, HuggingFace token loader).
-
-Tests live under `tests/` mirroring the package structure.
+- `mywhisper/__init__.py` bootstrap + exports
+- `mywhisper/transcribe.py` Whisper pipelines
+- `mywhisper/diarize.py` PyAnnote diarization
+- `mywhisper/assign.py` speaker naming
+- `mywhisper/podcasts.py` Apple Podcasts catalog + importer
+- `mywhisper/config.py` shared config helpers
+- Tests mirror the package under `tests/`
 
 ---
 
-### Design Principles
-- Implement submodules as cohesive class-based components with minimal surface area.
-- Provide factory methods to hide complex configuration and model loading details.
-- Configure logging per submodule; root logger `mywhisper` supplies baseline level.
-- Expose pipeline stages via generators so callers can orchestrate long-running work.
-- Reference original podcast files directly; avoid redundant audio copies.
-- Store temporary artefacts under `data/` with deterministic eight-digit episode keys for traceability.
-- Maintain ≥90 % automated test coverage (unit and integration); enforce coverage thresholds in CI.
-- Follow KISS: limit defensive handling of unlikely error states.
+### Core Principles
+- Keep submodules cohesive, class-based, and factory-backed (`from_config` hides model and IO setup).
+- Emit work as generators returning `PipelineEvent` structures when `yield_progress=True`.
+- Use the Apple Podcasts cache path stored on `PodcastEpisode.source_path`; never copy `xxxx.mp3` into `mywhisper` data directories except for temporary derived chunks.
+- All persistent artefacts live under `data/` (configurable) and start with the deterministic eight-digit episode key (e.g. `12345678_with_names.json`).
+- Maintain ≥80 % automated coverage and bias toward simple error handling (fail fast on unexpected states).
 
 ---
 
 ### Cross-Cutting Conventions
-- **Logging**
-  - Root logger name: `mywhisper`. Submodules derive child loggers (`mywhisper.transcribe`, etc.).
-  - Each public class accepts an optional `logging.Logger` or log level; default is a child logger with module name.
-  - Provide module-level `configure_logging(level: int | str)` that sets the root logger and optional stream/file handlers.
-
-- **Temporary artefacts**
-  - Base directory: `data/` (configurable). Pipelines operate relative to a `data_root: Path`.
-  - Episode keys: deterministic eight-digit strings derived from `PodcastEpisode.episode_id` (stored on the model and in catalog metadata).
-  - Artefact naming template: `{podcast_slug}__{episode_key}__{purpose}.{ext}` to allow reverse lookup.
-  - Pipelines only reference the source podcast file by path; they never duplicate the original audio unless transformation is unavoidable (e.g. temporary chunk export for diarization).
-
-- **Shared domain models**
-  - `PodcastEpisode`: dataclass capturing `episode_id`, `show_title`, `episode_title`, `description` (optional str), `published_at`, `author`, `source_path`, `duration_sec`, `metadata` (dict).
-  - `TranscriptSegment`: dataclass with `start`, `end`, `text`, optional `speaker_id`, `speaker_name`, `confidence`, `metadata`.
-  - `SpeakerCluster`: dataclass wrapping diarization output (`speaker_id`, `segments: list[Segment]`, `profile: SpeakerProfile`).
-
-- **Factories & configuration**
-  - Each primary pipeline class offers `from_config(**kwargs)` factory reading high-level settings (e.g. sample rate, HF token, chunk size) and constructing dependencies.
-  - Factories hide third-party model initialization details.
-
-- **Pipelines as generators**
-  - Long-running processes (chunk extraction, diarization, LLM inference) expose generator stages, allowing callers to iterate over progress and optionally short-circuit.
-  - Public pipeline methods accept `yield_progress: bool = False`; when enabled they return iterables yielding structured progress events (`PipelineEvent` dataclass with `stage`, `step_name`, `payload`, `elapsed`).
-  - Events expose enough metadata (episode id, step identifiers, artefact paths) for external adapters to persist checkpoints without modifying core pipeline control flow.
+- **Logging**: root logger `mywhisper`; modules derive child loggers and optionally accept injected `logging.Logger` instances. Provide `configure_logging(level)` helper.
+- **Domain Models**: `PodcastEpisode`, `TranscriptSegment`, `SpeakerCluster`, `SpeakerAssignment`, and `PipelineEvent` dataclasses define shared IO shapes.
+- **Artefact Rules**: `data_root` defaults to `data/`; optional podcast-slug directories, but filenames always begin with the episode key. Temporary chunk/export folders also sit under `data_root`.
+- **Progress Hooks**: long-running tasks (chunking, diarization, LLM inference) may stream events via callbacks for CLI/GUI consumption.
 
 ---
 
-## Module Specifications
+## Module Requirements
 
 ### `mywhisper/transcribe`
-
-#### Responsibilities
-- Load or stream podcast audio without duplicating source files.
-- Normalise audio and sample rate for Whisper.cpp.
-- Run transcription using a preloaded Whisper model.
-- Persist transcript JSON for reuse by downstream modules.
-
-#### Key Classes
-- `TranscriptionConfig`
-  - Fields: `model_path`, `language`, `target_sample_rate`, `chunk_duration`, `chunk_overlap`, `output_dir`, `device`.
-  - Method `resolve_paths(data_root: Path) -> None` ensures directories exist.
-
-- `WhisperModelFactory`
-  - Static method `create(config: TranscriptionConfig) -> Model` returning a `pywhispercpp.model.Model` instance.
-
-- `AudioChunker`
-  - Initialised with `chunk_duration`, `overlap`, `target_sample_rate`.
-  - Method `iterate_chunks(source: Path) -> Generator[AudioChunk, None, None]` yields `AudioChunk` dataclasses referencing in-memory tensors and on-disk wav paths inside `data_root/transcribe/{episode_key}`.
-  - Resamples via `torchaudio.transforms.Resample` only when necessary.
-  - Ensures stereo audio is downmixed to mono, mirroring `examples/transcribe_audio.py`.
-
-- `PodcastTranscriber`
-  - Constructor accepts `podcast: PodcastEpisode`, `config: TranscriptionConfig`, `model: Model`, `chunker: AudioChunker`, and optional logger.
-  - `from_config(podcast: PodcastEpisode, config: TranscriptionConfig) -> PodcastTranscriber` loads the model and chunker.
-  - `transcribe(yield_progress: bool = False) -> list[TranscriptSegment] | Generator[PipelineEvent, None, list[TranscriptSegment]]`
-    - Steps: `prepare_audio` (full audio or chunked), `run_model` (calls `model.transcribe`), `normalize_segments` (convert centiseconds to seconds via `WHISPER_TIME_FACTOR` equivalent), `persist_transcript`.
-    - Persists transcripts under `data/transcripts/{podcast_slug}/{episode_key}_whisper.json`.
-  - `load_cached_segments() -> list[TranscriptSegment]` reads a previously stored transcript.
-
-#### Artefacts
-- Extracted chunk files only exist when chunking is required. Each chunk is stored once and reused between runs, keyed by the episode’s eight-digit `episode_key`.
-- Transcript JSON schema matches example script output: list of dicts with `start`, `end`, `text`.
-
----
+- Responsibilities: normalize cached audio (downmix + resample), invoke Whisper.cpp models, persist transcripts as `{episode_key}_whisper.json`, and optionally reuse cached segments.
+- Key classes: `TranscriptionConfig` (paths, language, chunking, device), `WhisperModelFactory`, `AudioChunker`, and `PodcastTranscriber`.
+- Artefacts: chunk WAVs (only when chunking), transcript JSON aligned with example schema.
 
 ### `mywhisper/diarize`
-
-#### Responsibilities
-- Run the PyAnnote speaker diarization pipeline end-to-end on the full source audio.
-- Surface PyAnnote progress updates via `pyannote.audio.pipelines.utils.hook.ProgressHook`.
-- Normalize audio loading and resampling so the pipeline always receives a mono waveform tensor.
-- Persist RTTM (and optional JSON transcripts) under the standard `data/transcripts` layout.
-
-#### Key Classes
-- `DiarizationConfig`
-  - Fields: `hf_token`, `num_speakers`, `device`, `output_dir`, `rttm_dir`, `target_sample_rate`.
-  - Provides `progress_hook_factory` (defaults to `TqdmProgressHook`) so callers can override UI integration.
-
-- `WaveformLoader`
-  - Static method `load(path: Path, target_sample_rate: int) -> dict[str, torch.Tensor | int]`.
-  - Uses `torchaudio.load`, resamples when needed, and downmixes stereo to mono.
-
-- `PyAnnotePipelineFactory`
-  - Static `create_pipeline(config: DiarizationConfig) -> Pipeline`.
-  - Applies HuggingFace auth token and moves the pipeline to `config.device` when provided.
-
-- `DiarizationPipeline`
-  - Constructor parameters: `podcast`, `config`, `pipeline`, `waveform_loader`, optional `ProgressHook`.
-  - `from_config(...)` instantiates the pipeline and hook factory.
-  - `run(progress: bool = True) -> list[DiarizedTurn]` wraps `pipeline(...)`, passing the waveform dict and hook.
-  - Aggregates the resulting `pyannote.core.Annotation`, writes RTTM to `data/transcripts/rttm/{slug}_{episode_key}.rttm`, and returns diarized turns sorted by start time.
-  - `write_json_transcript(...)` unchanged: converts `TranscriptSegment` objects into a JSON payload compatible with downstream speaker assignment.
-
-#### Artefacts
-- RTTM files only: `{slug}_{episode_key}.rttm` under `data/transcripts/rttm/`.
-- Optional diarization JSON mirroring `examples/diarize_audio_4_0_0.py` output when `write_json_transcript` is invoked.
-
----
+- Responsibilities: run PyAnnote end-to-end on the cache file, surface `ProgressHook` updates, write RTTM plus optional diarization JSON.
+- Key classes: `DiarizationConfig` (HF token, device, output dirs), `WaveformLoader`, `PyAnnotePipelineFactory`, `DiarizationPipeline`.
+- Artefacts: `{episode_key}.rttm`, optional `{episode_key}_diarization.json`.
 
 ### `mywhisper/assign`
+- Responsibilities: merge transcripts + diarization, build speaker profiles, gather candidate names, drive LLM-based inference (default Ollama), and persist `{episode_key}_with_names.json`.
+- Key classes: `AssignmentConfig`, `SpeakerProfileBuilder`, `CandidateRoster`, `LLMClient`/`OllamaClient`, `SpeakerInferenceEngine`.
+- Behaviour: enforce confidence threshold (fallback `"UNKNOWN"`), support iterative refinement, expose generator progress hooks.
+- Artefacts: enriched transcript JSON, optional CSV analytics export.
 
-#### Responsibilities
-- Combine diarized transcripts with metadata to infer human-readable speaker names.
-- Interact with local LLM (via Ollama) or alternative inference providers.
-- Persist enriched transcripts including confidence and justification.
+### Prettify Step
+- Module: `mywhisper/prettify.py` exporting `PrettifyConfig` + `TranscriptPrettifier`.
+- Collapse contiguous segments (speaker match, ≤`collapse_gap_seconds` pause, `max_block_characters` guard), format as `<speaker name> (<speaker_id>): <text>`, and write `{episode_key}_readable.txt`.
+- Register artefact kind `readable_transcript` via `PodcastCatalog.record_artefact(...)` and emit generator-driven `PipelineEvent(stage="prettify", step_name="prettify")` for load/collapse/persist.
+- Config knobs: `data_root`, `collapse_gap_seconds` (default 1.5 s), optional `max_block_characters`, output subdir override.
 
-#### Key Classes
-- `AssignmentConfig`
-  - Fields: `ollama_model`, `max_iterations`, `high_confidence_threshold`, `spacy_model`, `sample_utterances_start`, `sample_utterances_end`, `output_dir`.
-  - `load_spacy_model()` caches the spaCy pipeline if available.
-
-- `SpeakerProfileBuilder`
-  - `build(segments: Sequence[TranscriptSegment]) -> dict[str, SpeakerProfile]` (reuses dataclass from examples).
-  - Extracts per-speaker stats, sample quotes.
-
-- `CandidateRoster`
-  - Combines metadata sources (`PodcastEpisode`, stored `EpisodeMetadata`, manual roster) and spaCy-extracted names.
-  - `compile(additional: Optional[Iterable[str]] = None) -> list[str]`.
-
-- `LLMClient`
-  - Abstract base supporting `generate(prompt: str) -> str`.
-  - Default implementation `OllamaClient` posts to `http://localhost:11434/api/generate`, matching example script.
-  - Optionally support retries and timeout configuration, but keep logic simple per KISS principle.
-
-- `SpeakerInferenceEngine`
-  - Orchestrates prompt construction (`build_prompt` akin to `build_inference_prompt`), LLM calls, JSON parsing, and critic pass.
-  - Methods:
-    - `infer(profiles, roster, context, target_speakers) -> list[SpeakerAssignment]`
-    - `critic(assignments) -> dict[str, bool]`
-    - `consolidate(prior, new) -> dict[str, SpeakerAssignment]`
-
-  - Constructor parameters: `podcast`, `config`, `profile_builder`, `roster`, `llm_client`, `logger`.
-  - `from_config(podcast, diarized_segments, transcript_path, config)` to auto-load transcript and dependencies.
-  - `assign_names(yield_progress: bool = False) -> list[TranscriptSegment] | Generator[PipelineEvent, None, list[TranscriptSegment]]`
-    - Steps: `load_diarized_transcript`, `build_profiles`, `prepare_roster`, `run_inference_cycle`, `critic_pass`, optional refinement.
-    - Enforces high-confidence rule: assignments below threshold are labelled `"UNKNOWN"`.
-    - Persists enriched transcript under `data/transcripts/{podcast_slug}/{episode_key}_with_names.json`.
-
-#### Artefacts
-- Assignment summary persisted as JSON list aligning with `examples/infer_speaker_names.py`.
-- Optional CSV export for analytics (`speaker_assignments.csv`) containing speaker_id, name, confidence.
-
----
+### Thematize Step
+- Module: `mywhisper/thematize.py` exposing `ThematizeConfig` + `EpisodeThematizer`.
+- Ingest readable transcript, normalize into ≤2 000-token chunks with ~15 % overlap, prompt configurable LLM (`llm_model`, default Ollama) using templated instructions, and parse JSON `[{"theme","summary","highlights"}]` payloads.
+- Merge adjacent identical themes, persist `{episode_key}_themes.json`, register artefact kind `themes`, and emit `PipelineEvent(stage="thematize")` per chunk plus final persist event (checkpoint includes `themes_path`).
+- On LLM failure or empty transcript, fall back to a single `fallback_theme` section summarizing the transcript snippet + failure reason.
 
 ### `mywhisper/podcasts`
-
-#### Responsibilities
-- Discover and track podcast episodes copied from the Apple Podcasts cache.
-- Provide query interfaces by show title, GUID, publication date, or filesystem path.
-- Support ingestion from cache (via logic inspired by `examples/copy_podcasts_from_cache.py`).
-
-#### Schema
-- SQLite database stored at `data/podcasts/catalog.db`.
-- Tables:
-  - `episodes(id TEXT PRIMARY KEY, show_title TEXT, episode_title TEXT, author TEXT, guid TEXT, published_at TEXT, cache_path TEXT, audio_path TEXT, duration_sec REAL, metadata_json TEXT)`.
-  - `artefacts(artefact_key TEXT PRIMARY KEY, episode_id TEXT, kind TEXT, path TEXT, created_at TEXT)` — `artefact_key` stores the same eight-digit `episode_key` recorded in episode metadata.
-- Indices on `show_title`, `guid`, and `published_at`.
-
-#### Key Classes
-- `PodcastCatalog`
-  - Constructor accepts `db_path: Path`, ensures schema initialised.
-  - `upsert_episode(episode: PodcastEpisode) -> None`, `get_episode(id | guid | path) -> PodcastEpisode | None`.
-  - `list_episodes(show_title: Optional[str] = None, since: Optional[datetime] = None) -> Iterable[PodcastEpisode]`.
-  - `record_artefact(episode_id: str, kind: str, path: Path, artefact_key: str)` persists artefact paths indexed by the episode’s `episode_key`.
-
-- `ApplePodcastsImporter`
-  - Initialized with cache roots (`cache_root`, `db_path`), optional `mdls` enrichment flag.
-  - `scan() -> Generator[PodcastEpisode, None, None]` replicates extraction from example script but stops at metadata mapping; copy/move handled by caller.
-  - `register_in_catalog(catalog: PodcastCatalog, output_dir: Path, move: bool = False) -> Generator[PipelineEvent, None, None]`
-    - Events include `episode_discovered`, `audio_copied`, `guid_recorded`.
-  - Sanitizes file names and writes GUID sidecars mirroring `extract_episode`.
-
-#### Integration with Pipelines
-- `PodcastEpisode.source_path` is the canonical audio file consumed by `PodcastTranscriber` and `DiarizationPipeline`.
-- When pipelines produce artefacts, they call `catalog.record_artefact(...)` to maintain traceability.
+- Responsibilities: index cache-resident episodes, expose queries (by show title, GUID, date, path), and orchestrate ingestion without copying audio.
+- Storage: SQLite `data/catalog.db` with `episodes` and `artefacts` tables; artefact keys reuse the episode key stub.
+- Classes: `PodcastCatalog` (CRUD + artefact registration) and `ApplePodcastsImporter` (scan cache, emit discovery events, optional metadata enrichment).
+- Integration: pipelines rely on `PodcastEpisode.source_path` (always the cache path) and call `catalog.record_artefact(...)` whenever they persist outputs.
 
 ---
 
-## Inter-Module Workflow
-1. **Episode discovery**: `ApplePodcastsImporter` scans cache, registers episodes via `PodcastCatalog`, and stores original audio path without duplication.
-2. **Transcription**: `PodcastTranscriber` loads the episode, optionally chunking, transcribes via Whisper, and stores transcript JSON + artefact record.
-3. **Diarization**: `DiarizationPipeline` reuses the same `PodcastEpisode` to create RTTM and diarized transcript artefacts.
-4. **Speaker assignment**: `TranscriptAssigner` merges transcript and diarization outputs, queries metadata (show title, description) from `PodcastEpisode.metadata`, and persists enriched transcript.
+## Workflow Summary
+1. **Discover** episodes via `ApplePodcastsImporter`, store metadata + cache paths in `PodcastCatalog`.
+2. **Transcribe** using `PodcastTranscriber`; reuse cached chunks and save `{episode_key}_whisper.json`.
+3. **Diarize** through `DiarizationPipeline`, writing `{episode_key}.rttm` and optional diarization JSON.
+4. **Assign speakers** via `SpeakerInferenceEngine`, yielding `{episode_key}_with_names.json`.
+5. **Prettify** to readable text blocks.
+6. **Thematize** into structured topic sections.
 
-Each step can resume from persisted artefacts thanks to consistent naming and catalog records.
-
----
-
-## Logging & Metrics
-- Pipelines emit structured `PipelineEvent` instances with attributes `stage`, `message`, `payload`.
-- Default logger level derived from root `mywhisper` logger; per-module configuration allows enabling verbose logs for targeted debugging.
-- Optional integration hook: `PipelineEvent` generators accept a callback `on_event(event: PipelineEvent)` for streaming progress to CLI/GUI.
+Each stage resumes from artefacts identified by the episode key and records outputs in the catalog for traceability.
 
 ---
 
-## Minimal External Dependencies
-- `pywhispercpp` (Whisper inference).
-- `torchaudio`, `torch`.
-- `pyannote.audio`, `pyannote.core`, `huggingface_hub`, `tqdm`.
-- `numpy`, `scikit-learn`, `joblib`.
-- `spaCy` (optional; downgrade gracefully when unavailable).
-- `requests` (for Ollama).
-- `pydub` (chunk splitting).
-- `sqlite3` (standard library).
-
-The package avoids heavy custom error handling; errors bubble to the caller unless they relate to predictable recoverable states (e.g. missing spaCy model, absent HF token).
+## Logging, Metrics, and Events
+- All pipelines emit `PipelineEvent(stage, step_name, payload, elapsed)` objects and may forward them through callbacks.
+- Modules inherit logging configuration from `mywhisper` unless callers override per class.
+- Metrics (elapsed time per stage, artefact paths) remain minimal but standardized within the event payloads.
 
 ---
 
-## Open Questions & Assumptions
-- Episode metadata (`description`, `host_roster`) may be absent; pipelines must degrade gracefully without these fields.
-- LLM prompt templates remain configurable but initial implementation mirrors example behaviour.
-- No built-in parallelism; generators enable callers to adopt async/concurrent orchestration externally.
+## External Dependencies
+- Core ML/audio: `pywhispercpp`, `torch`, `torchaudio`, `pyannote.audio`, `pyannote.core`, `huggingface_hub`.
+- Utilities: `tqdm`, `numpy`, `scikit-learn`, `joblib`, `spaCy` (optional), `requests` (Ollama), `pydub`, standard library `sqlite3`.
+- Philosophy: prefer upstream error handling; only guard predictable recoverable scenarios (e.g., missing spaCy model or HF token).
+
+---
+
+## Open Points
+- Metadata gaps (description, roster) must not break pipelines; degrade gracefully.
+- Prompt templates remain configurable and may evolve, but defaults match the examples.
+- Parallelism is caller-managed; generators simply expose checkpoints for orchestration frameworks.
+
+---
+
+## CLI Resume Semantics and Persistence
+- CLI offers three scopes: Full pipeline (from beginning), Resume pipeline (only when not fully completed), and Partial pipeline (user-selected start and end).
+- Resume starts at the next pending step and runs through the end.
+- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → assign → prettify → thematize`).
+  - Constraint: the starting step must be at or before the current in-progress step recorded in `pipeline_status.current_step` for the episode (when present). If no active `current_step`, any step can be chosen as the start.
+  - Constraint: the ending step must be at or after the selected starting step. If start equals end, only that step runs.
+  - Artefact prerequisites still apply when skipping steps; validations ensure required artefacts exist (or the user must include the producing step in the selection).
+- Persistence adds `pipeline_id` to checkpoints and a `pipeline_status` table tracking overall state per episode.
+- Consistency guard: if `pipeline_status.last_completed_step` lacks a matching checkpoint (or later-step checkpoints exist without it), the system warns and restarts from the first missing step.
 

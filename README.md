@@ -35,7 +35,7 @@ transcriber = PodcastTranscriber.from_config(episode, config)
 segments = transcriber.transcribe()
 ```
 
-See `examples/README.md` for end-to-end pipelines that combine `PodcastTranscriber`, `DiarizationPipeline`, and `TranscriptAssigner`.
+See `examples/README.md` for end-to-end pipelines that combine `PodcastTranscriber`, `DiarizationPipeline`, `TranscriptAssigner`, and the prettify/thematize stages. `examples/prettify_and_thematize.py` showcases how to turn assigned transcripts into readable text and themed summaries.
 
 ## Testing & Coverage
 
@@ -52,6 +52,8 @@ Coverage settings are configured in `pytest.ini`.
 - `mywhisper.transcribe` — Whisper transcription pipeline.
 - `mywhisper.diarize` — PyAnnote-based diarization with clustering.
 - `mywhisper.assign` — Speaker inference via LLMs.
+- `mywhisper.prettify` — Collapse diarized segments into readable transcripts and register the artefact.
+- `mywhisper.thematize` — Chunk readable transcripts and call an LLM to produce structured themes.
 - `mywhisper.podcasts` — SQLite-backed catalog of imported episodes.
 
 Generated artefacts live in `data/` by default. Configure logging via `mywhisper.configure_logging`.

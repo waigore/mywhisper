@@ -9,10 +9,12 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from ...assign import AssignmentConfig, TranscriptAssigner
-from ...checkpoints import PipelineEventAdapter, CheckpointStore
+from ...checkpoints import PipelineEventAdapter, CheckpointStore, PipelineCheckpoint
 from ...diarize import DiarizationConfig, DiarizationPipeline
 from ...models import DiarizedTurn, PipelineEvent, PodcastEpisode, TranscriptSegment
 from ...podcasts import PodcastCatalog
+from ...prettify import PrettifyConfig, TranscriptPrettifier
+from ...thematize import EpisodeThematizer, ThematizeConfig
 from ...transcribe import PodcastTranscriber, TranscriptionConfig
 from ..config import MywConfig
 from ..messages import PipelineCompleted, PipelineEventPayload, PipelineProgress, PipelineStopped
@@ -42,7 +44,7 @@ def _serialize_dataclass(instance: Any) -> Dict[str, Any]:
 
 ProgressCallback = Callable[[PipelineProgress | PipelineStopped | PipelineCompleted], None]
 
-STEP_ORDER = ("transcribe", "diarize", "assign")
+STEP_ORDER = ("transcribe", "diarize", "assign", "prettify", "thematize")
 
 
 class PipelineInterrupted(Exception):
@@ -55,6 +57,7 @@ class PipelineContext:
     resume: bool
     completed_steps: Dict[str, str]
     step_plan: tuple[str, ...]
+    pipeline_id: Optional[str] = None
 
 
 class PipelineRunner:
@@ -106,11 +109,38 @@ class PipelineRunner:
                 self.queue.release_current()
                 continue
 
+            step_plan = self._resolve_step_plan(item)
+            checkpoints = list(self.checkpoints.get_episode(episode.episode_id))
+            if self._should_reset_checkpoints(item, step_plan, checkpoints):
+                self.checkpoints.delete_episode(episode.episode_id)
+                LOGGER.info(
+                    "Cleared %d checkpoints for episode %s before rerun",
+                    len(checkpoints),
+                    episode.episode_id,
+                )
+                checkpoints = []
+
+            # Mark status: in_progress
+            try:
+                if item.pipeline_id:
+                    self.checkpoints.set_pipeline_status(
+                        episode_id=episode.episode_id,
+                        pipeline_id=item.pipeline_id,
+                        status="in_progress",
+                        current_step=None,
+                        last_completed_step=None,
+                        progress=0.0,
+                        remarks="Starting pipeline",
+                    )
+            except Exception:
+                LOGGER.debug("Pipeline status update failed (startup) for %s", episode.episode_id)
+
             context = PipelineContext(
                 episode=episode,
                 resume=item.resume,
-                completed_steps=self._completed_steps(episode.episode_id),
-                step_plan=self._resolve_step_plan(item),
+                completed_steps=self._completed_steps(episode.episode_id, checkpoints),
+                step_plan=step_plan,
+                pipeline_id=item.pipeline_id,
             )
             LOGGER.info(
                 "Executing plan %s for episode %s (resume=%s)",
@@ -143,7 +173,11 @@ class PipelineRunner:
                 self.queue.release_current()
 
     def _process_episode(self, context: PipelineContext) -> None:
-        adapter = PipelineEventAdapter(self.checkpoints, episode_id=context.episode.episode_id)
+        adapter = PipelineEventAdapter(
+            self.checkpoints,
+            episode_id=context.episode.episode_id,
+            pipeline_id=context.pipeline_id,
+        )
 
         plan = context.step_plan
         transcript_segments: Optional[Sequence[TranscriptSegment]] = None
@@ -250,6 +284,9 @@ class PipelineRunner:
         self._validate_diarization_availability(plan, context.completed_steps, diarization_results)
         self._check_stop()
 
+        assignment_path: Optional[Path] = None
+        readable_path: Optional[Path] = None
+
         if (
             "assign" in plan
             and "assign" not in context.completed_steps
@@ -263,7 +300,56 @@ class PipelineRunner:
                     "No diarization turns available for %s; speaker IDs will remain unset.",
                     context.episode.episode_id,
                 )
-            self._run_assignment(context, transcript_segments, adapter)
+            assigned_segments, derived_assignment_path = self._run_assignment(
+                context,
+                transcript_segments,
+                adapter,
+            )
+            if assigned_segments is not None:
+                transcript_segments = assigned_segments
+            assignment_path = derived_assignment_path or self._load_assignment_path(context)
+        elif any(step in plan for step in ("assign", "prettify", "thematize")):
+            assignment_path = self._load_assignment_path(context)
+
+        self._validate_assignment_availability(plan, assignment_path)
+        self._check_stop()
+
+        if "prettify" in plan:
+            if "prettify" not in context.completed_steps:
+                if assignment_path is None:
+                    raise RuntimeError("Assignments are required for prettify.")
+                readable_path = self._run_prettify(context, adapter, assignment_path)
+            else:
+                readable_path = self._load_readable_path(context)
+                if not readable_path or not readable_path.exists():
+                    LOGGER.warning(
+                        "Readable transcript missing for %s; regenerating prettify output.",
+                        context.episode.episode_id,
+                    )
+                    if assignment_path is None:
+                        raise RuntimeError("Assignments are required for prettify.")
+                    readable_path = self._run_prettify(context, adapter, assignment_path)
+        elif "thematize" in plan:
+            readable_path = self._load_readable_path(context)
+
+        self._validate_readable_availability(plan, readable_path)
+        self._check_stop()
+
+        if "thematize" in plan:
+            if "thematize" not in context.completed_steps:
+                if readable_path is None:
+                    raise RuntimeError("Readable transcript required for thematization.")
+                self._run_thematize(context, adapter, readable_path)
+            else:
+                themes_path = self._load_themes_path(context)
+                if not themes_path or not themes_path.exists():
+                    LOGGER.warning(
+                        "Themes artefact missing for %s; regenerating thematization output.",
+                        context.episode.episode_id,
+                    )
+                    if readable_path is None:
+                        raise RuntimeError("Readable transcript required for thematization.")
+                    self._run_thematize(context, adapter, readable_path)
         self._check_stop()
 
     def _run_transcription(
@@ -403,12 +489,42 @@ class PipelineRunner:
                 return Path(path)
         return None
 
+    def _load_assignment_path(self, context: PipelineContext) -> Optional[Path]:
+        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "assign")
+        if checkpoint and checkpoint.status == "completed":
+            path = checkpoint.details.get("assignment_path") or checkpoint.payload.get("path")
+            if path:
+                resolved = Path(path)
+                if resolved.exists():
+                    return resolved
+        return None
+
+    def _load_readable_path(self, context: PipelineContext) -> Optional[Path]:
+        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "prettify")
+        if checkpoint and checkpoint.status == "completed":
+            path = checkpoint.details.get("readable_path") or checkpoint.payload.get("path")
+            if path:
+                resolved = Path(path)
+                if resolved.exists():
+                    return resolved
+        return None
+
+    def _load_themes_path(self, context: PipelineContext) -> Optional[Path]:
+        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "thematize")
+        if checkpoint and checkpoint.status == "completed":
+            path = checkpoint.details.get("themes_path") or checkpoint.payload.get("path")
+            if path:
+                resolved = Path(path)
+                if resolved.exists():
+                    return resolved
+        return None
+
     def _run_assignment(
         self,
         context: PipelineContext,
         segments: Sequence[TranscriptSegment],
         adapter: PipelineEventAdapter,
-    ) -> Sequence[TranscriptSegment]:
+    ) -> tuple[Sequence[TranscriptSegment], Optional[Path]]:
         config = AssignmentConfig(
             data_root=self.config.data_dir,
             ollama_model=self.config.ollama_model,
@@ -437,7 +553,83 @@ class PipelineRunner:
                 "source": "fresh",
             },
         )
-        return assignment
+        assignment_path = getattr(assigner, "_last_assignment_path", None)
+        if assignment_path:
+            assignment_path = Path(assignment_path)
+        return assignment, assignment_path
+
+    def _run_prettify(
+        self,
+        context: PipelineContext,
+        adapter: PipelineEventAdapter,
+        assignment_path: Path,
+    ) -> Path:
+        config = PrettifyConfig(data_root=self.config.data_dir)
+        self._log_step_start(
+            context,
+            "prettify",
+            {
+                "mode": "execute",
+                "assignment_path": str(assignment_path),
+            },
+        )
+        start_time = perf_counter()
+        prettifier = TranscriptPrettifier(
+            podcast=context.episode,
+            config=config,
+            catalog=self.catalog,
+        )
+        events = prettifier.prettify(assignment_path=assignment_path, yield_progress=True)
+        readable_path = self._consume_events(context, adapter, "prettify", events, context.step_plan)
+        elapsed = perf_counter() - start_time
+        self._log_step_end(
+            context,
+            "prettify",
+            {
+                "path": str(readable_path),
+                "elapsed": round(elapsed, 2),
+                "source": "fresh",
+            },
+        )
+        return readable_path
+
+    def _run_thematize(
+        self,
+        context: PipelineContext,
+        adapter: PipelineEventAdapter,
+        readable_path: Path,
+    ) -> Path:
+        config = ThematizeConfig(
+            data_root=self.config.data_dir,
+            llm_model=self.config.ollama_model,
+        )
+        self._log_step_start(
+            context,
+            "thematize",
+            {
+                "mode": "execute",
+                "readable_path": str(readable_path),
+            },
+        )
+        start_time = perf_counter()
+        thematizer = EpisodeThematizer(
+            podcast=context.episode,
+            config=config,
+            catalog=self.catalog,
+        )
+        events = thematizer.thematize(readable_path=readable_path, yield_progress=True)
+        themes_path = self._consume_events(context, adapter, "thematize", events, context.step_plan)
+        elapsed = perf_counter() - start_time
+        self._log_step_end(
+            context,
+            "thematize",
+            {
+                "path": str(themes_path),
+                "elapsed": round(elapsed, 2),
+                "source": "fresh",
+            },
+        )
+        return themes_path
 
     def _consume_events(
         self,
@@ -470,12 +662,27 @@ class PipelineRunner:
             self._check_stop()
             return
 
-        adapter.process(event)
+        checkpoint = adapter.process(event)
         self.queue.set_status(
             context.episode.episode_id,
             "In progress",
             event.message,
         )
+        # Update pipeline status row
+        try:
+            if checkpoint.pipeline_id:
+                last_completed = checkpoint.step if checkpoint.status == "completed" else None
+                self.checkpoints.set_pipeline_status(
+                    episode_id=context.episode.episode_id,
+                    pipeline_id=checkpoint.pipeline_id,
+                    status="in_progress",
+                    current_step=step,
+                    last_completed_step=last_completed,
+                    progress=self._progress_for(step, event, step_plan),
+                    remarks=event.message,
+                )
+        except Exception:
+            LOGGER.debug("Pipeline status update failed for %s step %s", context.episode.episode_id, step)
         status = PipelineStatus(
             active=True,
             episode_id=context.episode.episode_id,
@@ -493,6 +700,18 @@ class PipelineRunner:
             step,
             _stringify_data(inputs),
         )
+        # Record intended current step early so that failures before first event still reflect the step
+        try:
+            if context.pipeline_id:
+                self.checkpoints.set_pipeline_status(
+                    episode_id=context.episode.episode_id,
+                    pipeline_id=context.pipeline_id,
+                    status="in_progress",
+                    current_step=step,
+                    remarks=f"Starting {step}",
+                )
+        except Exception:
+            LOGGER.debug("Pipeline status early-step update failed for %s step %s", context.episode.episode_id, step)
 
     def _log_step_end(self, context: PipelineContext, step: str, outputs: Dict[str, Any]) -> None:
         LOGGER.info(
@@ -549,9 +768,27 @@ class PipelineRunner:
             "unknown_segments": unknown_segments,
         }
 
-    def _completed_steps(self, episode_id: str) -> Dict[str, str]:
-        checkpoints = self.checkpoints.get_episode(episode_id)
-        return {cp.step: cp.status for cp in checkpoints if cp.status == "completed"}
+    def _completed_steps(
+        self,
+        episode_id: str,
+        checkpoints: Optional[Iterable[PipelineCheckpoint]] = None,
+    ) -> Dict[str, str]:
+        checkpoint_rows = checkpoints if checkpoints is not None else self.checkpoints.get_episode(episode_id)
+        return {cp.step: cp.status for cp in checkpoint_rows if cp.status == "completed"}
+
+    def _should_reset_checkpoints(
+        self,
+        item: QueueItem,
+        plan: Sequence[str],
+        checkpoints: Sequence[PipelineCheckpoint],
+    ) -> bool:
+        if item.resume:
+            return False
+        if not plan:
+            return False
+        if plan[0] != STEP_ORDER[0]:
+            return False
+        return bool(checkpoints)
 
     def _resolve_step_plan(self, item: QueueItem) -> tuple[str, ...]:
         raw_plan = item.steps or STEP_ORDER
@@ -595,6 +832,30 @@ class PipelineRunner:
                 "Diarization results are required for assignment. Run diarization first or include it in the plan."
             )
 
+    def _validate_assignment_availability(
+        self,
+        plan: Sequence[str],
+        assignment_path: Optional[Path],
+    ) -> None:
+        if not any(step in plan for step in ("prettify", "thematize")):
+            return
+        if assignment_path is None or not assignment_path.exists():
+            raise RuntimeError(
+                "Speaker assignment artefact is required. Include the assignment step before prettify/thematize."
+            )
+
+    def _validate_readable_availability(
+        self,
+        plan: Sequence[str],
+        readable_path: Optional[Path],
+    ) -> None:
+        if "thematize" not in plan:
+            return
+        if readable_path is None or not readable_path.exists():
+            raise RuntimeError(
+                "Readable transcript artefact is required for thematization. Run prettify first or include it in the plan."
+            )
+
     def _completion_message(self, plan: Sequence[str]) -> str:
         normalized = list(plan) or list(STEP_ORDER)
         if tuple(normalized) == STEP_ORDER:
@@ -605,6 +866,8 @@ class PipelineRunner:
                 "transcribe": "Transcription complete",
                 "diarize": "Diarization complete",
                 "assign": "Assignment complete",
+                "prettify": "Prettify complete",
+                "thematize": "Thematization complete",
             }
             return mapping.get(step, f"{step.title()} complete")
         pretty = ", ".join(step.title() for step in normalized)
@@ -638,6 +901,21 @@ class PipelineRunner:
         self.callback(PipelineProgress(payload))
 
     def _emit_stop(self, episode_id: str, remarks: str) -> None:
+        try:
+            # Mark stopped in status table
+            # We do not know pipeline_id here; best-effort read last known
+            status_row = self.checkpoints.get_pipeline_status(episode_id)
+            if status_row:
+                self.checkpoints.set_pipeline_status(
+                    episode_id=episode_id,
+                    pipeline_id=status_row["pipeline_id"],
+                    status="stopped",
+                    # Preserve the last known step to reflect where it failed/paused
+                    current_step=status_row.get("current_step"),
+                    remarks=remarks,
+                )
+        except Exception:
+            LOGGER.debug("Pipeline status stop update failed for %s", episode_id)
         if not self.callback:
             return
         status = PipelineStatus(active=False, episode_id=episode_id, step="Stopped", message=remarks)
@@ -645,6 +923,20 @@ class PipelineRunner:
         self.callback(PipelineStopped(payload))
 
     def _emit_complete(self, episode_id: str, remarks: str) -> None:
+        try:
+            status_row = self.checkpoints.get_pipeline_status(episode_id)
+            if status_row:
+                self.checkpoints.set_pipeline_status(
+                    episode_id=episode_id,
+                    pipeline_id=status_row["pipeline_id"],
+                    status="completed",
+                    current_step="Completed",
+                    last_completed_step="thematize",
+                    progress=1.0,
+                    remarks=remarks,
+                )
+        except Exception:
+            LOGGER.debug("Pipeline status completion update failed for %s", episode_id)
         if not self.callback:
             return
         status = PipelineStatus(active=False, episode_id=episode_id, step="Completed", message=remarks, progress=1.0)

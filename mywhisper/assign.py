@@ -5,6 +5,7 @@ Speaker assignment pipeline for mywhisper.
 from __future__ import annotations
 
 import time
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence, Tuple
@@ -17,11 +18,12 @@ import re
 import requests
 import spacy
 
-from .config import ensure_data_subdir, resolve_data_root
+from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
 from .models import (
     PipelineEvent,
     PodcastEpisode,
     SpeakerAssignment,
+    SpeakerNameGuesses,
     SpeakerProfile,
     TranscriptSegment,
 )
@@ -36,7 +38,9 @@ class AssignmentConfig:
     """
 
     ollama_model: str = "llama3"
-    max_iterations: int = 2
+    ollama_json_mode: bool = True
+    ollama_use_json_schema: bool = True
+    max_iterations: int = 1
     high_confidence_threshold: float = 0.7
     spacy_model: str = "en_core_web_sm"
     sample_utterances_start: int = 50
@@ -50,8 +54,7 @@ class AssignmentConfig:
         episode_key: Optional[str] = None,
     ) -> Path:
         key = episode_key or podcast.episode_key
-        slug = podcast.artefact_slug()
-        dir_path = ensure_data_subdir(f"transcripts/{slug}", self.data_root)
+        dir_path = ensure_episode_subdir(key, self.data_root, "transcripts")
         return dir_path / f"{key}_with_names.json"
 
 
@@ -149,7 +152,7 @@ class LLMClient:
     Base LLM client abstraction.
     """
 
-    def generate(self, prompt: str) -> str:  # pragma: no cover - interface
+    def generate(self, prompt: str, json_schema: Optional[Dict[str, Any]] = None) -> str:  # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -158,12 +161,24 @@ class OllamaClient(LLMClient):
     Ollama HTTP API client.
     """
 
-    def __init__(self, model_name: str, endpoint: str = "http://localhost:11434/api/generate") -> None:
+    def __init__(self, model_name: str, endpoint: str = "http://localhost:11434/api/generate", json_mode: bool = True) -> None:
         self.model_name = model_name
         self.endpoint = endpoint
+        self.json_mode = json_mode
 
-    def generate(self, prompt: str) -> str:
-        payload = {"model": self.model_name, "prompt": prompt, "stream": False}
+    def generate(self, prompt: str, json_schema: Optional[Dict[str, Any]] = None) -> str:
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        if json_schema:
+            # Prefer schema-guided JSON if available; keep temperature at 0 for determinism
+            # Some Ollama versions accept a structured format object for schema guidance.
+            payload["format"] = {"type": "json", "schema": json_schema}
+        elif self.json_mode:
+            payload["format"] = "json"
         response = requests.post(self.endpoint, json=payload, timeout=120)
         response.raise_for_status()
         data = response.json()
@@ -186,32 +201,55 @@ class SpeakerInferenceEngine:
         roster: Sequence[str],
         context_summary: str,
         target_speakers: Sequence[str],
-    ) -> List[SpeakerAssignment]:
+    ) -> Dict[str, SpeakerNameGuesses]:
         speaker_blocks = [
             profiles[speaker_id].to_prompt_block()
             for speaker_id in target_speakers
             if speaker_id in profiles
         ]
         prompt = self._build_prompt(speaker_blocks, roster, context_summary)
-        self.logger.debug("Invoking LLM with prompt length %d characters", len(prompt))
-        response = self.client.generate(prompt)
+        self.logger.info("LLM prompt (%d chars):\n%s", len(prompt), prompt)
+        schema: Optional[Dict[str, Any]] = self._json_schema() if getattr(self.config, "ollama_use_json_schema", True) else None
+        # Be resilient to clients that don't accept json_schema kwarg (e.g., test stubs)
+        try:
+            response = self.client.generate(prompt, json_schema=schema)
+        except TypeError:
+            response = self.client.generate(prompt)
+        self.logger.info("LLM response (%d chars):\n%s", len(response), response)
         return self._parse_assignments(response)
 
     def critic(self, assignments: Sequence[SpeakerAssignment]) -> Dict[str, bool]:
+        """
+        Evaluate assignments by enforcing a single highest-confidence speaker per
+        normalized name. Additional speakers with the same name but lower confidence are
+        rejected. When multiple speakers share the same confidence for the same name, the
+        critic signals False for all tied speakers so the caller can trigger a tie-break.
+        """
+
         consistency: Dict[str, bool] = {}
-        seen: Dict[str, str] = {}
+        grouped: Dict[str, List[SpeakerAssignment]] = defaultdict(list)
         for assignment in assignments:
-            name = assignment.proposed_name.strip().lower()
+            grouped[assignment.proposed_name.strip().lower()].append(assignment)
+
+        for name, candidates in grouped.items():
+            sorted_candidates = sorted(candidates, key=lambda item: item.confidence, reverse=True)
+            top_confidence = sorted_candidates[0].confidence
+            tied = [item for item in sorted_candidates if abs(item.confidence - top_confidence) < 1e-6]
+
             if name == "unknown":
-                consistency[assignment.speaker_id] = assignment.confidence <= self.config.high_confidence_threshold
+                for candidate in sorted_candidates:
+                    consistency[candidate.speaker_id] = candidate.confidence <= self.config.high_confidence_threshold
                 continue
-            previous = seen.get(name)
-            if previous and previous != assignment.speaker_id:
-                consistency[assignment.speaker_id] = False
-                consistency[previous] = False
-            else:
-                seen[name] = assignment.speaker_id
-                consistency.setdefault(assignment.speaker_id, True)
+
+            if len(tied) == 1:
+                consistency[sorted_candidates[0].speaker_id] = True
+                for candidate in sorted_candidates[1:]:
+                    consistency[candidate.speaker_id] = False
+                continue
+
+            for candidate in sorted_candidates:
+                consistency[candidate.speaker_id] = False
+
         return consistency
 
     def consolidate(
@@ -226,6 +264,14 @@ class SpeakerInferenceEngine:
                 merged[assignment.speaker_id] = assignment
         return merged
 
+    def select_best(self, guesses: Dict[str, SpeakerNameGuesses]) -> Dict[str, SpeakerAssignment]:
+        best: Dict[str, SpeakerAssignment] = {}
+        for speaker_id, guess in guesses.items():
+            choice = guess.best()
+            if choice:
+                best[speaker_id] = choice
+        return best
+
     def _build_prompt(
         self,
         speaker_blocks: Sequence[str],
@@ -237,40 +283,110 @@ class SpeakerInferenceEngine:
         instructions = (
             "You are identifying real speaker names for diarized podcast segments.\n"
             "Use the episode context and candidate names to infer who each speaker likely is.\n"
-            "Return a JSON array; each element must include speaker_id, proposed_name, confidence (0-1), justification.\n"
-            'If unsure, use "UNKNOWN" with confidence <= 0.3.\n'
-            "Do not write anything other than JSON."
+            "Return ONLY a valid JSON array. No prose, no markdown, no code fences.\n"
+            "Each element must be an object: {\"speaker_id\": string, \"proposed_names\": [{\"name\": string, \"confidence\": number, \"justification\": string}]}.\n"
+            "Confidence is between 0 and 1. Include multiple proposed_names ordered by confidence.\n"
+            "Emit each speaker exactly once. If unsure, include a proposal with name \"UNKNOWN\" and confidence <= 0.3."
+        )
+        example = (
+            '[\n'
+            '  {\n'
+            '    "speaker_id": "SPEAKER_00",\n'
+            '    "proposed_names": [\n'
+            '      {"name": "Anthony Pompliano", "confidence": 0.92, "justification": "Matches intro and host context"},\n'
+            '      {"name": "UNKNOWN", "confidence": 0.2, "justification": "Low evidence alternative"}\n'
+            '    ]\n'
+            '  }\n'
+            ']'
         )
         return (
             f"{instructions}\n\n"
+            f"Output JSON MUST conform to the above and resemble this example (structure only, not content):\n{example}\n\n"
             f"Episode Context:\n{context_summary}\n\n"
             f"Candidate Names: {candidates}\n\n"
             f"Speaker Evidence:\n{speaker_section}\n"
         )
 
+    def _json_schema(self) -> Dict[str, Any]:
+        # JSON Schema enforcing the expected output structure
+        return {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["speaker_id", "proposed_names"],
+                "properties": {
+                    "speaker_id": {"type": "string"},
+                    "proposed_names": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "confidence", "justification"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "justification": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
     _UNQUOTED_SPEAKER_ID = re.compile(r'("speaker_id"\s*:\s*)([A-Za-z0-9_:-]+)(\s*[,}])')
 
-    def _parse_assignments(self, raw_output: str) -> List[SpeakerAssignment]:
+    def _parse_assignments(self, raw_output: str) -> Dict[str, SpeakerNameGuesses]:
         payload = self._strip_code_fences(raw_output.strip())
         data = self._loads_with_recovery(payload)
         if data is None:
             self.logger.error("Failed to parse LLM output: %s", payload)
-            return []
+            return {}
 
-        assignments: List[SpeakerAssignment] = []
+        if isinstance(data, dict):
+            data = [data]
+
+        if not isinstance(data, list):
+            self.logger.error("Unexpected LLM payload (expected list): %s", payload)
+            return {}
+
+        guesses: Dict[str, SpeakerNameGuesses] = {}
         for item in data:
             try:
-                assignments.append(
-                    SpeakerAssignment(
-                        speaker_id=str(item["speaker_id"]),
-                        proposed_name=str(item.get("proposed_name", "UNKNOWN")).strip() or "UNKNOWN",
-                        confidence=float(item.get("confidence", 0.0)),
-                        justification=str(item.get("justification", "")).strip(),
-                    )
-                )
+                speaker_id = str(item["speaker_id"])
             except (TypeError, ValueError, KeyError) as exc:
                 self.logger.warning("Skipping malformed assignment %s: %s", item, exc)
-        return assignments
+                continue
+
+            guess = guesses.setdefault(speaker_id, SpeakerNameGuesses(speaker_id=speaker_id))
+            proposals = item.get("proposed_names")
+            if not proposals:
+                proposals = [
+                    {
+                        "name": item.get("proposed_name", "UNKNOWN"),
+                        "confidence": item.get("confidence", 0.0),
+                        "justification": item.get("justification", ""),
+                    }
+                ]
+
+            if not isinstance(proposals, list):
+                proposals = [proposals]
+
+            for proposal in proposals:
+                try:
+                    assignment = SpeakerAssignment(
+                        speaker_id=speaker_id,
+                        proposed_name=str(proposal.get("name", "UNKNOWN")).strip() or "UNKNOWN",
+                        confidence=float(proposal.get("confidence", 0.0)),
+                        justification=str(proposal.get("justification", "")).strip(),
+                    )
+                except (TypeError, ValueError) as exc:
+                    self.logger.warning("Skipping malformed proposal %s: %s", proposal, exc)
+                    continue
+                guess.add_proposal(assignment)
+
+        return guesses
 
     def _strip_code_fences(self, text: str) -> str:
         if not text.startswith("```"):
@@ -328,7 +444,7 @@ class TranscriptAssigner:
         config: AssignmentConfig,
         client: Optional[LLMClient] = None,
     ) -> "TranscriptAssigner":
-        engine_client = client or OllamaClient(config.ollama_model)
+        engine_client = client or OllamaClient(config.ollama_model, json_mode=getattr(config, "ollama_json_mode", True))
         inference_engine = SpeakerInferenceEngine(config, engine_client)
         return cls(podcast=podcast, config=config, inference_engine=inference_engine)
 
@@ -442,17 +558,28 @@ class TranscriptAssigner:
         if not target_speakers:
             return []
 
-        assignments = self.inference_engine.infer(
+        guesses = self.inference_engine.infer(
             profiles=profiles,
             roster=roster,
             context_summary=context_summary,
             target_speakers=target_speakers,
         )
-        assignment_map = self.inference_engine.consolidate({}, assignments)
+        self.logger.info("Inference guesses: %s", self._guess_snapshot(guesses))
+
+        best_assignments = self.inference_engine.select_best(guesses)
+        assignment_map = self.inference_engine.consolidate({}, best_assignments.values())
+        assignment_map = self._resolve_name_conflicts(
+            assignment_map,
+            guesses,
+            profiles,
+            roster,
+            context_summary,
+            segments,
+        )
         critic_flags = self.inference_engine.critic(list(assignment_map.values()))
         self.logger.info(
             "Inference assignments: %s",
-            self._assignment_snapshot(assignments),
+            self._assignment_snapshot(assignment_map.values()),
         )
 
         elapsed = time.perf_counter() - start_time
@@ -462,7 +589,7 @@ class TranscriptAssigner:
             episode_id=self.podcast.episode_id,
             message="Completed initial inference",
             payload={
-                "assignments": len(assignments),
+                "assignments": len(guesses),
                 "step": "inference_round",
             },
             checkpoint={
@@ -482,17 +609,28 @@ class TranscriptAssigner:
         ]
 
         if unresolved and self.config.max_iterations > 1:
-            refined_assignments = self.inference_engine.infer(
+            refined_guesses = self.inference_engine.infer(
                 profiles=profiles,
                 roster=roster,
                 context_summary=context_summary + "\nFocus on uncertain speakers only.",
                 target_speakers=unresolved,
             )
-            assignment_map = self.inference_engine.consolidate(assignment_map, refined_assignments)
+            self.logger.info("Refinement guesses: %s", self._guess_snapshot(refined_guesses))
+            best_refined = self.inference_engine.select_best(refined_guesses)
+            assignment_map = self.inference_engine.consolidate(assignment_map, best_refined.values())
+            guesses.update(refined_guesses)
+            assignment_map = self._resolve_name_conflicts(
+                assignment_map,
+                guesses,
+                profiles,
+                roster,
+                context_summary,
+                segments,
+            )
             critic_flags = self.inference_engine.critic(list(assignment_map.values()))
             self.logger.info(
                 "Refinement assignments: %s",
-                self._assignment_snapshot(refined_assignments),
+                self._assignment_snapshot(assignment_map.values()),
             )
 
             elapsed = time.perf_counter() - start_time
@@ -502,7 +640,7 @@ class TranscriptAssigner:
                 episode_id=self.podcast.episode_id,
                 message="Completed refinement inference",
                 payload={
-                    "assignments": len(refined_assignments),
+                "assignments": len(refined_guesses),
                     "step": "refinement_round",
                 },
                 checkpoint={
@@ -604,6 +742,24 @@ class TranscriptAssigner:
             )
         return snapshot
 
+    def _guess_snapshot(self, guesses: Dict[str, SpeakerNameGuesses]) -> List[Dict[str, Any]]:
+        snapshot: List[Dict[str, Any]] = []
+        for speaker_id in sorted(guesses.keys()):
+            guess = guesses[speaker_id]
+            snapshot.append(
+                {
+                    "speaker_id": speaker_id,
+                    "proposed_names": [
+                        {
+                            "name": proposal.proposed_name,
+                            "confidence": round(proposal.confidence, 3),
+                        }
+                        for proposal in guess.proposed_names
+                    ],
+                }
+            )
+        return snapshot
+
     def _context_summary(self, metadata: Dict[str, str]) -> str:
         description = (
             metadata.get("description")
@@ -620,6 +776,188 @@ class TranscriptAssigner:
         if description:
             summary_parts.append(f"Description: {description}")
         return "\n".join(summary_parts)
+
+    def _resolve_name_conflicts(
+        self,
+        assignments: Dict[str, SpeakerAssignment],
+        guesses: Dict[str, SpeakerNameGuesses],
+        profiles: Dict[str, SpeakerProfile],
+        roster: Sequence[str],
+        context_summary: str,
+        segments: Sequence[TranscriptSegment],
+    ) -> Dict[str, SpeakerAssignment]:
+        if not assignments:
+            return assignments
+
+        updated = dict(assignments)
+        # Attempt resolution until no further progress is made.
+        while True:
+            groups = self._group_assignments_by_name(updated)
+            progress = False
+            for name, speaker_ids in groups.items():
+                if len(speaker_ids) < 2 or name == "unknown":
+                    continue
+
+                ranked = sorted(
+                    (updated[speaker_id] for speaker_id in speaker_ids),
+                    key=lambda assignment: assignment.confidence,
+                    reverse=True,
+                )
+                top_conf = ranked[0].confidence
+                tied = [assignment for assignment in ranked if abs(assignment.confidence - top_conf) < 1e-6]
+
+                if len(tied) == 1:
+                    continue
+
+                tie_ids = [assignment.speaker_id for assignment in tied]
+                self.logger.warning(
+                    "Name conflict detected for '%s' among %s (confidence %.3f); attempting tie-break.",
+                    name,
+                    tie_ids,
+                    top_conf,
+                )
+                tie_updates = self._tie_break_with_segments(
+                    speaker_ids=tie_ids,
+                    segments=segments,
+                    roster=roster,
+                    context_summary=context_summary,
+                    profiles=profiles,
+                )
+                if tie_updates:
+                    for speaker_id, assignment in tie_updates.items():
+                        updated[speaker_id] = assignment
+                        guesses.setdefault(speaker_id, SpeakerNameGuesses(speaker_id=speaker_id)).add_proposal(assignment)
+                    progress = True
+                    break
+
+                self._assign_random_unique_names(tie_ids, updated, guesses)
+                progress = True
+                break
+
+            if not progress:
+                break
+
+        return updated
+
+    def _group_assignments_by_name(self, assignments: Dict[str, SpeakerAssignment]) -> Dict[str, List[str]]:
+        grouped: Dict[str, List[str]] = defaultdict(list)
+        for speaker_id, assignment in assignments.items():
+            grouped[assignment.proposed_name.strip().lower()].append(speaker_id)
+        return grouped
+
+    def _tie_break_with_segments(
+        self,
+        speaker_ids: Sequence[str],
+        segments: Sequence[TranscriptSegment],
+        roster: Sequence[str],
+        context_summary: str,
+        profiles: Dict[str, SpeakerProfile],
+    ) -> Dict[str, SpeakerAssignment]:
+        window = self._extract_overlap_segments(segments, speaker_ids)
+        if not window:
+            return {}
+
+        tie_context = self._format_segments_for_context(window)
+        updated_context = f"{context_summary}\nTie-break evidence:\n{tie_context}"
+        tie_guesses = self.inference_engine.infer(
+            profiles=profiles,
+            roster=roster,
+            context_summary=updated_context,
+            target_speakers=speaker_ids,
+        )
+        self.logger.info("Tie-break guesses for %s: %s", speaker_ids, self._guess_snapshot(tie_guesses))
+        best = self.inference_engine.select_best(tie_guesses)
+        if len(best) < len(speaker_ids):
+            return {}
+
+        normalized = {assignment.proposed_name.strip().lower() for assignment in best.values()}
+        if len(normalized) != len(best):
+            return {}
+
+        return best
+
+    def _extract_overlap_segments(
+        self,
+        segments: Sequence[TranscriptSegment],
+        speaker_ids: Sequence[str],
+        window: int = 25,
+    ) -> List[TranscriptSegment]:
+        targets = set(filter(None, speaker_ids))
+        if len(targets) <= 1:
+            return []
+
+        if not segments:
+            return []
+
+        preferred_start = max(0, self.config.sample_utterances_start)
+        search_start = preferred_start if preferred_start < len(segments) else 0
+
+        for start in range(search_start, len(segments)):
+            end = min(len(segments), start + window)
+            window_segments = segments[start:end]
+            present = {seg.speaker_id for seg in window_segments if seg.speaker_id in targets}
+            if present == targets:
+                return window_segments
+
+        return []
+
+    def _format_segments_for_context(self, segments: Sequence[TranscriptSegment]) -> str:
+        lines = []
+        for seg in segments:
+            speaker = seg.speaker_id or "UNKNOWN"
+            lines.append(f"[{seg.start:.2f}-{seg.end:.2f}] {speaker}: {seg.text}")
+        return "\n".join(lines)
+
+    def _assign_random_unique_names(
+        self,
+        speaker_ids: Sequence[str],
+        assignments: Dict[str, SpeakerAssignment],
+        guesses: Dict[str, SpeakerNameGuesses],
+    ) -> None:
+        rng = random.Random(self.podcast.episode_id)
+        shuffled = list(speaker_ids)
+        rng.shuffle(shuffled)
+        used_names = {
+            assignment.proposed_name.strip().lower()
+            for assignment in assignments.values()
+            if assignment.proposed_name
+        }
+        conflict_names = {
+            assignments[speaker_id].proposed_name.strip().lower()
+            for speaker_id in speaker_ids
+            if assignments[speaker_id].proposed_name
+        }
+        for name in conflict_names:
+            used_names.discard(name)
+
+        for speaker_id in shuffled:
+            guess = guesses.get(speaker_id)
+            candidates = guess.proposed_names if guess else [assignments[speaker_id]]
+            selected: Optional[SpeakerAssignment] = None
+            for candidate in candidates:
+                normalized = candidate.proposed_name.strip().lower()
+                if normalized and normalized != "unknown" and normalized not in used_names:
+                    selected = SpeakerAssignment(
+                        speaker_id=speaker_id,
+                        proposed_name=candidate.proposed_name,
+                        confidence=candidate.confidence,
+                        justification=candidate.justification,
+                    )
+                    used_names.add(normalized)
+                    break
+
+            if selected is None:
+                fallback_name = f"UNKNOWN_{speaker_id}"
+                selected = SpeakerAssignment(
+                    speaker_id=speaker_id,
+                    proposed_name=fallback_name,
+                    confidence=assignments[speaker_id].confidence,
+                    justification="Randomized unique fallback due to irreconcilable tie.",
+                )
+                used_names.add(fallback_name.lower())
+
+            assignments[speaker_id] = selected
+            guesses.setdefault(speaker_id, SpeakerNameGuesses(speaker_id=speaker_id)).add_proposal(selected)
 
     def _label_segments(
         self,

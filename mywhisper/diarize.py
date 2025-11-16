@@ -18,7 +18,7 @@ from pyannote.audio.pipelines.utils.hook import ProgressHook
 from pyannote.core import Annotation
 from tqdm.auto import tqdm
 
-from .config import ensure_data_subdir, resolve_data_root
+from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
 from .models import DiarizedTurn, PodcastEpisode, TranscriptSegment
 
 LOGGER = logging.getLogger("mywhisper.diarize")
@@ -36,7 +36,6 @@ class DiarizationConfig:
     num_speakers: Optional[int] = None
     target_sample_rate: int = 16000
     output_dir: Path = field(default_factory=lambda: ensure_data_subdir("transcripts"))
-    rttm_dir: Path = field(default_factory=lambda: ensure_data_subdir("transcripts/rttm"))
     data_root: Path = field(default_factory=resolve_data_root)
     device: Optional[torch.device | str] = None
     progress_hook_factory: Optional[ProgressHookFactory] = None
@@ -47,13 +46,11 @@ class DiarizationConfig:
         episode_key: Optional[str] = None,
     ) -> dict[str, Path]:
         key = episode_key or podcast.episode_key
-        slug = podcast.artefact_slug()
-        transcript_dir = ensure_data_subdir(f"transcripts/{slug}", self.data_root)
-        rttm_dir = ensure_data_subdir("transcripts/rttm", self.data_root)
+        transcript_dir = ensure_episode_subdir(key, self.data_root, "transcripts")
         return {
             "transcript_dir": transcript_dir,
             "json_path": transcript_dir / f"{key}_diarization.json",
-            "rttm_path": rttm_dir / f"{slug}_{key}.rttm",
+            "rttm_path": transcript_dir / f"{key}.rttm",
         }
 
 

@@ -1,202 +1,122 @@
-# Myw Textual Frontend Specification
+# Myw Textual Frontend — Condensed Specification
 
 ## Purpose
 
-- Provide a terminal-native frontend (`myw.py`) for managing podcast catalog entries and invoking mywhisper transcription pipelines.
-- Abstract mywhisper’s generator-driven workflows behind a responsive Textual UI that keeps users informed without blocking.
-- Maintain parity with existing CLI capabilities while introducing richer status tracking and queue control.
+- Provide a terminal-native Textual UI (`myw.py`) that manages podcast catalogs and runs the full mywhisper pipeline (transcribe → diarize → assign → prettify → thematize).
+- Wrap generator-driven jobs in a responsive, non-blocking experience while matching existing CLI capabilities.
 
-## Design Principles
+## Guiding Principles
 
-- **KISS:** keep navigation shallow (two primary screens) and reuse mywhisper primitives wherever possible.
-- **Non-blocking UI:** all long-running work moves to a dedicated worker thread that communicates progress back to the Textual app.
-- **Observability:** log every user action and pipeline transition for auditability and debugging.
-- **Predictable state:** only one pipeline runs at a time; UI reflects authoritative state derived from the queue manager.
-- **Modularization:** isolate UI concerns from queue/pipeline orchestration and from I/O integrations.
+- **KISS navigation:** just `PodcastListingScreen` and `PodcastViewScreen`.
+- **Non-blocking:** pipeline work lives in a worker thread; UI stays responsive.
+- **Single source of truth:** queue controller owns authoritative state; only one pipeline at a time.
+- **Observability:** every user action and pipeline transition is logged/audited.
+- **Modular boundaries:** keep UI, queue orchestration, and I/O integrations independent.
 
-## Architecture Overview
+## Architecture
 
-- `Textual` application with two screens:
-  - `PodcastListingScreen`: default entry point showing catalog and pipeline state.
-  - `PodcastViewScreen`: detail view with enqueue action.
-- Core services:
-  - `CatalogService`: reads Apple Podcasts cache, syncs with `mywhisper.podcasts.PodcastCatalog`.
-  - `QueueController`: manages FIFO queue, exposes start/stop/resume controls, persists queue state in memory (no DB).
-  - `PipelineRunner`: consumes queue entries, runs mywhisper pipeline steps (transcribe → diarize → assign), broadcasts progress messages/events.
-- Communication patterns:
-  - Worker thread executes `PipelineRunner`.
-  - Main UI thread listens for queue/pipeline events via Textual `Message` subclasses.
-  - Shared data structures (e.g., queue, episode status map) protected with threading locks.
+- Textual app boots env/logging, instantiates screens plus services: `CatalogService`, `QueueController`, `PipelineRunner`.
+- Worker thread runs `PipelineRunner`; UI thread receives Textual `Message` updates. Shared data uses locks/conditions.
+- `CatalogService` reads Apple Podcasts cache into `mywhisper.podcasts.PodcastCatalog`, emitting `EpisodeViewState` rows.
+- `QueueController` exposes enqueue/dequeue/stop/resume, persists state to SQLite, and broadcasts status to widgets.
+- `PipelineRunner` executes the selected `step_plan`, persists checkpoints, emits progress, and records artefact paths.
 
-## Environment & Configuration
+## Configuration & Storage
 
-- Load `.env` via `python-dotenv` at app startup (`myw/__main__.py`).
-- Support variables:
-  - `MYW_LOG_LEVEL`, `MYW_DATA_DIR`, `MYW_PODCAST_CACHE_PATH`, `MYW_WHISPER_MODEL`, etc.
-  - `MYW_DB_PATH` pointing to `myw.db` (SQLite) that stores queue checkpoints and pipeline metadata.
-- Defer to existing mywhisper config helpers (e.g., `mywhisper.config.configure_logging`) when possible.
-- Fail fast with clear messaging if required env vars or cache paths are missing.
+- Load `.env` via `python-dotenv`; reuse mywhisper helpers for logging/config.
+- Required vars: `MYW_LOG_LEVEL`, `MYW_DATA_DIR`, `MYW_PODCAST_CACHE_PATH`, `MYW_WHISPER_MODEL`, `MYW_DB_PATH`. Fail fast when missing.
+- `myw.db` schema (all timestamps ISO8601):
+  - `queue_items`: `episode_id` PK, `position`, `status` (`downloaded|queued|in_progress|stopped|completed|failed`), `step_plan` JSON, `current_step`, `progress_percent`, `remarks`, `resume_token`, `created_at`, `updated_at` (index on `position`).
+  - `queue_events`: append-only audit log with `event_type` (`enqueue|start|stop|resume|dequeue|error`) and `payload_json` (index on `episode_id`).
+  - `pipeline_checkpoints`: existing table extended to store every canonical step, `plan_hash`, artefact paths (including `_readable.txt`, `_themes.json`), payload/details JSON, elapsed seconds.
+  - `artefact_registry`: `(episode_id, artefact_kind)` PK mapping `transcript|diarization|with_names|readable|themes` to file paths + metadata JSON.
+- Migration plan: additive schema updates, backfill queue/artefact tables from in-memory queue and existing checkpoints.
 
 ## Module Layout
 
 ```
 mywhisper/myw/
-  __init__.py
-  app.py                # Textual App subclass, bootstraps screens and services
-  config.py             # Env loading, defaults, path validation
-  logging.py            # Logging setup bridging Textual + mywhisper logging
-  models.py             # UI-facing dataclasses (EpisodeViewState, PipelineStatus)
+  app.py            # Textual App + screen wiring
+  config.py         # env + path validation
+  logging.py        # shared logging setup
+  models.py         # EpisodeViewState, PipelineStatus
   services/
-    catalog.py          # CatalogService implementation
-    queue.py            # QueueController with FIFO queue and state transitions
-    pipeline.py         # PipelineRunner consuming queue entries
+    catalog.py
+    queue.py
+    pipeline.py
   screens/
-    listing.py          # PodcastListingScreen
-    view.py             # PodcastViewScreen
+    listing.py
+    view.py
   widgets/
-    episode_table.py    # Sortable DataTable + selection handling
-    progress_bar.py     # Conditional progress display
-  messages.py           # Textual Message definitions for cross-thread updates
-  myw.py                # CLI entry: `textual run mywhisper.myw.myw:MywApp` (or direct `python -m mywhisper.myw.myw`)
+    episode_table.py
+    progress_bar.py
+  messages.py
+  myw.py            # entrypoint (textual run / python -m)
 ```
 
-- `EpisodeViewState` retains both the canonical `episode_id` and the derived eight-digit `episode_key` so UI layers can display human-friendly metadata while still surfacing the artefact key reused by pipeline artefacts and logs.
-- Keep public entrypoint slim; business logic resides in services.
-- Provide unit-testable services independent of Textual by using plain Python classes.
+Business logic resides in services; UI components remain thin/testable.
 
-## Startup & Catalog Sync Flow
+## Core Flows
 
-1. Load env/config, set up logging.
-2. Initialize `CatalogService` with Apple Podcasts cache path and `PodcastCatalog`.
-3. Call `CatalogService.sync_from_cache()`, which:
-   - Scans cache directory for downloaded episodes.
-   - Registers episodes in catalog (via `mywhisper.podcasts.register_episode` or equivalent).
-   - Produces in-memory `EpisodeViewState` list with status `Downloaded`.
-4. Emit `CatalogSynced` message to populate listing table.
-5. Provide manual sync via `(r)efresh`, reusing same service call and diffing statuses to update table efficiently.
+- **Startup:** load config → init services → `CatalogService.sync_from_cache()` → emit `CatalogSynced` to render listing; `(r)` refresh repeats diffed sync.
+- **Podcast listing:** sortable table (`Episode`, `Podcast`, `Downloaded At`, `Status`, `Remarks`), optional empty-state label, footer progress bar visible only when pipeline active. Keyboard: arrows for selection, `enter`/`v` to view, `s` to stop/resume, `r` to refresh.
+- **Podcast view:** shows metadata (titles, description, size, duration, paths, IDs), artefact summary, `(e)`/`enter` enqueue, `(b)` back, breadcrumb `Listing > Episode`.
 
-## Podcast Listing Screen
+## Queue & Pipeline
 
-- Components:
-  - Sortable `DataTable` with columns: Episode, Podcast, Downloaded At, Status, Remarks.
-    - Column semantics:
-      - `Episode`: display the human-readable episode title sourced from the cache `metadata.plist` or, if missing, the Podcasts database (`ZMTEPISODE.ZTITLE`); fall back to the audio filename stem only as a last resort.
-      - `Podcast`: display the show title from cache metadata or the Podcasts database (`ZMTPODCAST.ZTITLE`); fall back to `Unknown Show`.
-      - `Downloaded At`: show the filesystem modification timestamp of the imported audio asset (preserving the original cache download time when copied); leave blank if the timestamp cannot be determined.
-- Status enumerations: `Downloaded`, `In progress`, `Stopped`, `Completed`.
-  - `Downloaded` explicitly denotes episodes discovered in the local Apple Podcasts cache that have not yet entered the pipeline.
-  - Remarks:
-    - For active pipeline: show current step description (e.g., `Transcribing`, `Diarizing`, `Assigning speakers`).
-    - For stopped/completed: show last completed step or completion summary.
-  - Optional `Label` displayed when no episodes available.
-  - Footer progress widget (custom `ProgressBar`):
-    - Only visible when `PipelineStatus.active`.
-    - Shows percent overall progress + text of current step.
-- Interactions:
-  - Selection with arrow keys; `enter` or `(v)` opens Podcast View.
-  - `(r)` triggers `CatalogService.sync_from_cache()`; disable while sync in progress.
-  - `stop/resume` toggle command (`s` key):
-    - Stop: requests `QueueController.stop_current()`; transitions status to `Stopped`.
-    - Resume: when the current head is stopped, pressing `s` re-enqueues from the most recent checkpoint.
-- Screen listens for `PipelineProgress`, `PipelineFinished`, `PipelineStopped` messages to update table and progress bar.
-- Sorting:
-  - Default sort by `Downloaded At` descending.
-  - Allow toggling sort column via built-in DataTable headers.
+- Queue allows only one active job; remaining episodes stay FIFO but can be dequeued. Statuses: `Downloaded`, `In progress`, `Stopped`, `Completed`.
+- Each queue item carries a validated `step_plan`; runner enforces prerequisites (e.g., diarization requires transcript) and scales progress to planned steps.
+- `PipelineRunner` stages:
+  1. Transcribe (Whisper)
+  2. Diarize (PyAnnote)
+  3. Assign (LLM-produced speaker names)
+  4. Prettify (build `_readable.txt` from assignments)
+  5. Thematize (turn readable transcript into `_themes.json`)
+- Stage gating: prettify only runs when an assignment artefact exists; thematize requires a readable transcript. Missing artefacts trigger automatic reloads from checkpoints (or regeneration) before progressing.
+- After every step, persist checkpoints, update artefact registry, send Textual progress messages, and refresh listing remarks/progress bar.
+- Stop/resume:
+  - `stop_current` sets flag, runner halts between steps, marks `Stopped`, writes checkpoints.
+  - Resume loads checkpoints, verifies artefacts, skips completed steps, continues next pending step.
+- Partial plans reuse artefacts; restarts can optionally wipe checkpoints before re-run.
 
-## Podcast View Screen
+## Logging, Telemetry, and Recovery
 
-- Displays metadata for selected episode:
-  - Podcast title, Episode title, Description (render `N/A` when unavailable), File size, Duration, Download path, Current status, Episode ID, Episode key (same deterministic key surfaced in pipeline events and artefact paths).
-  - If transcription artifacts exist, show summary (transcript path, diarization status).
-- Commands:
-  - `(b)` returns to `PodcastListingScreen`, preserving the prior table selection.
-  - `(e)` / `enter` triggers `QueueController.enqueue(episode_id)`.
-  - If queue empty and pipeline idle, enqueue starts pipeline immediately.
-  - Provide confirmation toast/message to user.
-- Navigation:
-  - Support explicit `(b)` back navigation alongside default Textual shortcuts (escape/`ctrl+q`).
-  - Breadcrumb header showing `Listing > Episode`.
+- Dedicated `myw` logger; `INFO` for user actions, `DEBUG` for queue/pipeline, `WARNING/ERROR` for failures. Optionally surface warnings in UI.
+- Queue events mirror user actions for audit. Pipeline logs always include episode ID, step, elapsed, artefacts produced.
+- Error handling:
+  - Catalog sync failure → non-blocking alert + log, keep prior table.
+  - Pipeline error → mark `Stopped`, show message in remarks, allow resume, capture stack trace.
+  - Worker watchdog restarts background thread if it dies with pending work.
+  - Ignore invalid shortcuts; sanitize all user input.
 
-## Queue & Pipeline Processing
+## Extensibility
 
-- QueueController responsibilities:
-  - Maintain ordered queue of episode IDs.
-  - Track per-episode state (`Downloaded`, `In progress`, `Stopped`, `Completed`).
-  - Expose `enqueue`, `dequeue`, `stop_current`, `resume`, `current_episode` APIs.
-  - Persist checkpoint metadata (e.g., last completed pipeline step, intermediate artefact paths, timestamps) to `myw.db` so progress survives app restarts.
-  - Broadcast queue updates via Textual messages.
-- PipelineRunner:
-  - Runs in background thread started at app init.
-  - Waits on queue condition variable; pulls next episode when available.
-  - Executes pipeline steps sequentially using mywhisper components:
-    1. Transcribe (Whisper)
-    2. Diarize (PyAnnote)
-    3. Assign speaker names (LLM)
-  - Each step uses a `PipelineEventAdapter` that iterates the generator outputs (with `yield_progress=True`) to derive progress percentages and assemble checkpoint payloads (step id, chunk index, artefact paths).
-  - After each step:
-    - Update episode remarks/status.
-    - Emit progress events with percent and current step name.
-    - Persist intermediate outputs under `data/` and record their paths in `myw.db` to make them discoverable on resume.
-  - On completion:
-    - Mark status `Completed`, remove from queue, emit completion event.
-  - Supports stop:
-    - `stop_current` sets stop flag; runner checks between steps, gracefully cancels, marks `Stopped`, writes checkpoint metadata and ensures step outputs remain accessible.
-  - Supports resume:
-    - Runner reads checkpoint data from `myw.db`, verifies intermediate outputs exist, skips finished steps, restarts next pending step.
-- Partial execution:
-  - Every `QueueItem` carries a `step_plan` describing which subset of the canonical steps should run for that invocation; default plan contains all steps in canonical order.
-  - Runner iterates only the steps present in the plan, skipping the rest without surfacing errors.
-  - Diarization-only runs require a cached transcript; assignment-only runs require both transcript and diarization checkpoints. The runner validates prerequisites up front and surfaces actionable errors when inputs are missing.
-  - Progress percentages scale relative to the number of planned steps so the UI still shows `0 → 100%` even when skipping phases.
-  - Completed plan metadata is persisted alongside checkpoints so the queue can resume remaining steps later or prevent duplicate work.
-- Thread Safety:
-  - Use `threading.Lock` for shared state (statuses, queue list).
-  - Use `Queue` or `deque` + `Condition`.
-
-## Logging & Telemetry
-
-- Configure structured logging with a dedicated `myw` logger namespace.
-- Log levels:
-  - `INFO` for user actions (screen commands, enqueue, stop/resume, refresh).
-  - `DEBUG` for pipeline checkpoints and queue transitions.
-  - `WARNING/ERROR` for exceptions or failed Syncs.
-- Integrate Textual log handler to surface warnings in UI status bar (optional).
-- Ensure pipeline logs include episode ID, step name, elapsed time.
-
-## Error Handling & Recovery
-
-- Catalog sync failures:
-  - Show non-blocking alert in UI, log error, keep previous listing.
-- Pipeline execution errors:
-  - Mark episode `Stopped`, store error message in remarks, allow resume.
-  - Capture stack trace in log file.
-- Thread failures:
-  - Watchdog in `QueueController` restarts worker thread if it exits unexpectedly and queue non-empty.
-- Input validation:
-  - Sanitize user commands; ignore invalid key bindings gracefully.
-
-## Extensibility Notes
-
-- Future screens (e.g., settings, transcript viewer) can live under `screens/`.
-- Queue persistence can later move to SQLite without breaking UI by swapping `QueueController`.
-- Additional pipeline steps should extend a simple step registry consumed by `PipelineRunner`.
-- Provide hooks for publishing events to external observers (e.g., WebSocket, notifications) via message bus wrapper.
+- Additional screens (settings, transcript viewer) can be dropped under `screens/` without changing services.
+- Queue persistence can evolve (e.g., richer SQLite schema) by swapping `QueueController`.
+- New pipeline steps register in a step registry consumed by `PipelineRunner`.
+- Message bus hooks can forward progress to WebSocket/notification listeners.
 
 ## Conversational CLI (`mywconv.py`)
 
-- Purpose: lightweight guided CLI for running the pipeline without the Textual UI.
-- Flow:
-  1. Load config/logging, sync catalog, and list available episodes (existing behaviour).
-  2. Prompt the user to pick an episode by index or `episode_id`.
-  3. Immediately after selection, present a pipeline scope menu:
-     - `Full pipeline` (transcribe → diarize → assign).
-     - `Transcription only`.
-     - `Diarization only` (requires previously stored transcript; warn/abort if missing).
-  4. Checkpoint awareness:
-     - If the selected episode already has completed checkpoints for any of the requested steps, prompt the user to resume from the next pending step or restart from scratch (default to restart).
-     - Resuming preserves completed checkpoints; restarting wipes the episode’s checkpoints before enqueuing.
-  5. Translate the final choice into a `step_plan` and pass it to `QueueController.enqueue(...)` so the runner knows which steps to execute.
-  5. Stream progress via `PipelineMonitor` exactly as today; completion status message reflects the chosen scope (e.g., “Transcription complete”).
-  6. Exit with `0` on success, `2` when the pipeline stops or prerequisites fail.
-- Future enhancements (out of scope now) can add assignment-only or resume-from-checkpoint options following the same menu pattern.
+- Minimal guided CLI that reuses the same services: load config, sync catalog, prompt for episode, then choose between scopes:
+  - Full pipeline (from beginning)
+  - Resume pipeline (only shown if the episode is not fully completed)
+  - Partial pipeline (choose starting and ending steps)
+- Partial pipeline behavior:
+  - Steps are chosen from the canonical order: `transcribe`, `diarize`, `assign`, `prettify`, `thematize`.
+  - Starting step is constrained to be at or before the current in-progress step in `pipeline_status.current_step` (when present). If no current step, any step can be selected.
+  - Ending step must be at or after the starting step. If the same, only that step runs.
+  - Artefact prerequisites still apply when skipping steps (e.g., thematize requires a readable transcript); the CLI validates selected ranges and prompts to adjust if prerequisites are not met.
+- Resume semantics: start from the next pending step (e.g., if assignment is last completed, run assign → prettify → thematize).
+- Warn when prerequisites are missing; validate artefacts and automatically regenerate missing ones when required by downstream steps.
+- Translate choice into `step_plan`, enqueue via `QueueController`, stream progress through `PipelineMonitor`, exit `0` on success or `2` on stop/prereq failure.
+
+## Pipeline IDs and Status Persistence
+
+- Every pipeline run has a `pipeline_id` (UUID).
+- Starting a Full pipeline wipes previous checkpoints associated with any prior `pipeline_id` for the episode and creates a new `pipeline_id`.
+- Resuming reuses the existing `pipeline_id` recorded for the episode.
+- `myw.db` maintains a `pipeline_status` table that tracks: `episode_id` (PK), `pipeline_id`, `status` (`queued|in_progress|stopped|completed|failed`), `current_step`, `last_completed_step`, `progress`, `remarks`, `updated_at`.
+- Checkpoint rows also record `pipeline_id` to correlate artefacts with a specific run.
+- Consistency checks: if `pipeline_status` indicates a last completed step but the corresponding checkpoint is missing (or later-step checkpoints exist while the claimed last completed is missing), warn the user and restart from the first missing step.
 

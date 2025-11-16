@@ -19,9 +19,10 @@ def test_diarization_config_creates_expected_paths(tmp_path):
 
     paths = config.artefact_paths(episode)
 
-    assert paths["rttm_path"].name.endswith(f"{episode.artefact_slug()}_{episode.episode_key}.rttm")
+    assert paths["rttm_path"].name == f"{episode.episode_key}.rttm"
     assert paths["rttm_path"].parent.exists()
-    assert paths["json_path"].parent.exists()
+    assert paths["rttm_path"].parent.name == episode.episode_key
+    assert paths["json_path"].parent == paths["rttm_path"].parent
 
 
 def test_waveform_loader_resamples_and_downmixes(monkeypatch):

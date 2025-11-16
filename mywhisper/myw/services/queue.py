@@ -19,6 +19,7 @@ class QueueItem:
     resume: bool = False
     ready_at: float = 0.0
     steps: Optional[tuple[str, ...]] = None
+    pipeline_id: Optional[str] = None
 
 
 class QueueController:
@@ -45,6 +46,7 @@ class QueueController:
         episode_id: str,
         resume: bool = False,
         steps: Optional[Sequence[str]] = None,
+        pipeline_id: Optional[str] = None,
     ) -> None:
         with self._condition:
             if any(item.episode_id == episode_id for item in self._queue):
@@ -62,6 +64,7 @@ class QueueController:
                     resume=resume,
                     ready_at=ready_at,
                     steps=normalized_steps,
+                    pipeline_id=pipeline_id,
                 )
             )
             self._statuses.setdefault(episode_id, ("Downloaded", ""))
@@ -78,6 +81,7 @@ class QueueController:
         self,
         episode_id: str,
         steps: Optional[Sequence[str]] = None,
+        pipeline_id: Optional[str] = None,
     ) -> None:
         with self._condition:
             if any(item.episode_id == episode_id for item in self._queue):
@@ -88,6 +92,7 @@ class QueueController:
                     resume=True,
                     ready_at=time.monotonic(),
                     steps=tuple(steps) if steps else None,
+                    pipeline_id=pipeline_id,
                 )
             )
             self._statuses[episode_id] = ("In progress", "Resuming")

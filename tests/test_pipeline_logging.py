@@ -40,6 +40,9 @@ class DummyCheckpoints:
     def get_episode(self, *_args, **_kwargs):
         return []
 
+    def delete_episode(self, *_args, **_kwargs):
+        pass
+
 
 class InMemoryCheckpointStore(DummyCheckpoints):
     def __init__(self, rows: dict[tuple[str, str], PipelineCheckpoint] | None = None) -> None:
@@ -53,6 +56,10 @@ class InMemoryCheckpointStore(DummyCheckpoints):
 
     def upsert(self, checkpoint: PipelineCheckpoint) -> None:
         self._rows[(checkpoint.episode_id, checkpoint.step)] = checkpoint
+
+    def delete_episode(self, episode_id: str) -> None:
+        for key in [key for key in self._rows if key[0] == episode_id]:
+            del self._rows[key]
 
 
 def build_runner(tmp_path: Path, *, queue: DummyQueue | None = None, checkpoints: DummyCheckpoints | None = None) -> PipelineRunner:
@@ -167,7 +174,7 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         episode=episode,
         resume=False,
         completed_steps={},
-        step_plan=("transcribe", "diarize", "assign"),
+        step_plan=("transcribe", "diarize", "assign", "prettify", "thematize"),
     )
 
     transcript_segments = [
@@ -202,11 +209,77 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         def run(self):
             return [DiarizedTurn(start=0.0, end=1.0, speaker_id="S0")]
 
+    assignment_path = tmp_path / "assigned.json"
+    assignment_path.parent.mkdir(parents=True, exist_ok=True)
+    assignment_path.write_text("[]")
+    readable_path = tmp_path / "readable.txt"
+    readable_path.write_text("Host (S0): Hello")
+    themes_path = tmp_path / "themes.json"
+    themes_path.write_text("[]")
+
     class StubAssigner:
+        def __init__(self):
+            self._last_assignment_path = assignment_path
+
         def assign_names(self, segments, metadata=None, yield_progress=True):
             def generator():
-                yield make_event("assign", "started", "started")
+                yield PipelineEvent(
+                    stage="progress",
+                    step_name="assign",
+                    episode_id=episode.episode_id,
+                    message="started",
+                    payload={"step": "completed"},
+                    checkpoint={
+                        "status": "completed",
+                        "assignment_path": str(assignment_path),
+                    },
+                )
                 return assigned_segments
+
+            return generator()
+
+    class StubPrettifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
+            def generator():
+                yield PipelineEvent(
+                    stage="prettify",
+                    step_name="prettify",
+                    episode_id=episode.episode_id,
+                    message="prettifying",
+                    payload={"step": "completed"},
+                    checkpoint={
+                        "status": "completed",
+                        "readable_path": str(readable_path),
+                    },
+                    artefact_paths={"readable": readable_path},
+                )
+                return readable_path
+
+            return generator()
+
+    class StubThematizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def thematize(self, readable_path: Path | None = None, yield_progress: bool = True):
+            def generator():
+                yield PipelineEvent(
+                    stage="thematize",
+                    step_name="thematize",
+                    episode_id=episode.episode_id,
+                    message="thematizing",
+                    payload={"step": "completed"},
+                    checkpoint={
+                        "status": "completed",
+                        "themes_path": str(themes_path),
+                        "readable_path": str(readable_path),
+                    },
+                    artefact_paths={"themes": themes_path},
+                )
+                return themes_path
 
             return generator()
 
@@ -231,12 +304,22 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         "mywhisper.myw.services.pipeline.TranscriptAssigner.from_config",
         classmethod(lambda cls, episode, config: StubAssigner()),
     )
+    monkeypatch.setattr(
+        "mywhisper.myw.services.pipeline.TranscriptPrettifier",
+        StubPrettifier,
+    )
+    monkeypatch.setattr(
+        "mywhisper.myw.services.pipeline.EpisodeThematizer",
+        StubThematizer,
+    )
     monkeypatch.setattr("mywhisper.myw.services.pipeline.PipelineEventAdapter", StubAdapter)
 
     runner._process_episode(context)
 
     assert any(event.step_name == "transcribe" for event in captured_events)
     assert any(event.step_name == "assign" for event in captured_events)
+    assert any(event.step_name == "prettify" for event in captured_events)
+    assert any(event.step_name == "thematize" for event in captured_events)
 
 
 def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path):
@@ -373,6 +456,76 @@ def test_pipeline_runner_run_loop(monkeypatch, tmp_path):
     assert queue.status_updates[-1][0] == "ep-run"
     assert queue.status_updates[-1][1] == "Completed"
     assert queue.released == 2
+
+
+def test_pipeline_runner_clears_checkpoints_for_fresh_rerun(monkeypatch, tmp_path):
+    captured: list[PipelineContext] = []
+
+    def fake_process(self, context: PipelineContext):
+        captured.append(context)
+
+    monkeypatch.setattr(PipelineRunner, "_process_episode", fake_process)
+
+    episode = PodcastEpisode(
+        episode_id="ep-rerun",
+        show_title="Show",
+        episode_title="Episode",
+        source_path=tmp_path / "audio.wav",
+    )
+
+    class StubCatalog:
+        def get_episode(self, episode_id: str):
+            return episode if episode_id == episode.episode_id else None
+
+    class StubQueue:
+        def __init__(self):
+            self.items = [QueueItem(episode.episode_id), None]
+
+        def next_item(self):
+            return self.items.pop(0)
+
+        def release_current(self):
+            pass
+
+        def set_status(self, *_args, **_kwargs):
+            pass
+
+        def should_stop(self):
+            return False
+
+        def request_shutdown(self):
+            pass
+
+    store = InMemoryCheckpointStore(
+        {
+            (episode.episode_id, "transcribe"): PipelineCheckpoint(
+                episode_id=episode.episode_id,
+                step="transcribe",
+                status="completed",
+                stage="persisted",
+                message="done",
+            ),
+            (episode.episode_id, "assign"): PipelineCheckpoint(
+                episode_id=episode.episode_id,
+                step="assign",
+                status="started",
+                stage="progress",
+                message="working",
+            ),
+        }
+    )
+
+    runner = build_runner(tmp_path, queue=StubQueue(), checkpoints=store)
+    runner.catalog = StubCatalog()
+
+    runner._running.set()
+    runner._run()
+    runner._running.clear()
+
+    assert captured, "Pipeline runner did not process the episode"
+    assert captured[0].step_plan[0] == "transcribe"
+    assert captured[0].completed_steps == {}
+    assert store.get_episode(episode.episode_id) == []
 
 
 def test_read_transcript_supports_legacy_speaker_field(tmp_path):

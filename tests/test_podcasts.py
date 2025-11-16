@@ -33,13 +33,10 @@ def test_importer_registers_episode(tmp_path):
 
     data_root = tmp_path / "data"
     catalog = PodcastCatalog(data_root=data_root)
-    output_dir = tmp_path / "output"
 
     importer = ApplePodcastsImporter(
         cache_root=cache_root,
         catalog=catalog,
-        output_dir=output_dir,
-        move=False,
     )
 
     episodes = list(importer.register_in_catalog())

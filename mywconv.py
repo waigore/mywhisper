@@ -15,6 +15,7 @@ from mywhisper.myw.services.catalog import CatalogService
 from mywhisper.myw.services.pipeline import PipelineRunner, STEP_ORDER
 from mywhisper.myw.services.queue import QueueController
 from mywhisper.podcasts import PodcastCatalog
+from uuid import uuid4
 
 
 class PipelineMonitor:
@@ -91,11 +92,11 @@ def select_episode(episodes: Iterable[EpisodeViewState]) -> Optional[EpisodeView
     for index, episode in enumerate(episode_list, start=1):
         show = episode.show_title or "Unknown Show"
         title = episode.episode_title or "Untitled Episode"
-        print(f"{index:3d}. {show} - {title} [{episode.episode_id}]")
+        print(f"{index:3d}. [{episode.episode_key}] {show} - {title}")
     print()
 
     while True:
-        selection = input("Select an episode (number or ID, blank to cancel): ").strip()
+        selection = input("Select an episode (number or key, blank to cancel): ").strip()
         if not selection:
             return None
         if selection.isdigit():
@@ -104,7 +105,7 @@ def select_episode(episodes: Iterable[EpisodeViewState]) -> Optional[EpisodeView
                 return episode_list[choice - 1]
         else:
             for episode in episode_list:
-                if episode.episode_id == selection:
+                if episode.episode_key == selection:
                     return episode
         print("Invalid selection. Try again.", flush=True)
 
@@ -113,46 +114,128 @@ def select_pipeline_scope(
     episode: EpisodeViewState,
     checkpoints: CheckpointStore,
 ) -> tuple[Optional[tuple[str, ...]], str]:
-    options: dict[str, tuple[str, Optional[tuple[str, ...]]]] = {
-        "1": ("Full pipeline", None),
-        "2": ("Transcription only", ("transcribe",)),
-        "3": ("Diarization only", ("diarize",)),
-        "4": ("Assignment only", ("assign",)),
-    }
+    completed = _completed_step_names(checkpoints, episode.episode_id)
+    all_done = all(step in completed for step in STEP_ORDER)
+    options: dict[str, str] = {"1": "Full pipeline"}
+    if not all_done:
+        options["2"] = "Resume pipeline"
+    options["3"] = "Partial pipeline"
+
     print("Pipeline scopes:\n")
-    for key, (label, _) in options.items():
+    for key, label in options.items():
         print(f"  {key}. {label}")
     print()
 
-    default = "1"
+    default = "2" if "2" in options else "1"
     while True:
         selection = input(f"Select pipeline scope [{default}]: ").strip() or default
-        option = options.get(selection)
-        if not option:
+        label = options.get(selection)
+        if not label:
             print("Invalid selection. Try again.", flush=True)
             continue
-        label, plan = option
-        if plan == ("diarize",) and not _has_completed_step(checkpoints, episode.episode_id, "transcribe"):
-            print(
-                "Diarization-only requires an existing transcript. Run transcription first or choose a different option.",
-                flush=True,
-            )
-            continue
-        if plan == ("assign",):
-            missing_requirements = [
-                name
-                for name, step in (("transcription", "transcribe"), ("diarization", "diarize"))
-                if not _has_completed_step(checkpoints, episode.episode_id, step)
-            ]
-            if missing_requirements:
-                requirement_text = " and ".join(missing_requirements)
-                print(
-                    f"Assignment-only requires completed {requirement_text}. Run the necessary steps first or choose a different option.",
-                    flush=True,
-                )
+
+        if label == "Full pipeline":
+            return None, label
+
+        if label == "Partial pipeline":
+            plan = _prompt_partial_plan(episode, checkpoints)
+            if not plan:
+                # user aborted partial selection; restart scope selection
                 continue
-        normalized = tuple(plan) if plan else None
-        return normalized, label
+            warning = _validate_scope_requirements(
+                episode_id=episode.episode_id,
+                plan=plan,
+                checkpoints=checkpoints,
+            )
+            if warning:
+                print(warning, flush=True)
+                # loop back to scope selection
+                continue
+            return tuple(plan), label
+
+        # Resume: start from first pending step through the end
+        first_pending_index = 0
+        for idx, step in enumerate(STEP_ORDER):
+            if step not in completed:
+                first_pending_index = idx
+                break
+        plan = STEP_ORDER[first_pending_index:]
+        warning = _validate_scope_requirements(
+            episode_id=episode.episode_id,
+            plan=plan,
+            checkpoints=checkpoints,
+        )
+        if warning:
+            print(warning, flush=True)
+            continue
+        return tuple(plan), label
+
+
+def _prompt_partial_plan(
+    episode: EpisodeViewState,
+    checkpoints: CheckpointStore,
+) -> Optional[tuple[str, ...]]:
+    status_row = checkpoints.get_pipeline_status(episode.episode_id)
+    current_step = (status_row or {}).get("current_step") if status_row else None
+    last_completed = (status_row or {}).get("last_completed_step") if status_row else None
+    # Determine maximum allowed start index per constraint: at or before in-progress step,
+    # otherwise at or before last completed step if available; else allow any.
+    max_start_index = len(STEP_ORDER) - 1
+    if isinstance(current_step, str) and current_step in STEP_ORDER:
+        max_start_index = STEP_ORDER.index(current_step)
+    elif isinstance(last_completed, str) and last_completed in STEP_ORDER:
+        max_start_index = STEP_ORDER.index(last_completed)
+
+    allowed_starts = STEP_ORDER[: max_start_index + 1]
+
+    print("\nPartial pipeline selection:", flush=True)
+    print("Select starting step (must be at or before current in-progress step).", flush=True)
+    for idx, step in enumerate(allowed_starts, start=1):
+        print(f"  {idx}. {step}")
+    print()
+
+    start_choice: Optional[int] = None
+    while True:
+        raw = input(f"Start at [1-{len(allowed_starts)}] or name (blank to cancel): ").strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            num = int(raw)
+            if 1 <= num <= len(allowed_starts):
+                start_choice = num - 1
+                break
+        else:
+            lowered = raw.lower()
+            if lowered in allowed_starts:
+                start_choice = allowed_starts.index(lowered)
+                break
+        print("Invalid selection. Try again.", flush=True)
+
+    start_index = start_choice
+    end_candidates = STEP_ORDER[start_index :]  # inclusive range selection
+    print("\nSelect ending step (must be at or after the starting step).", flush=True)
+    for idx, step in enumerate(end_candidates, start=1):
+        print(f"  {idx}. {step}")
+    print()
+
+    while True:
+        raw = input(f"End at [1-{len(end_candidates)}] or name (blank to cancel): ").strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            num = int(raw)
+            if 1 <= num <= len(end_candidates):
+                end_index = start_index + (num - 1)
+                break
+        else:
+            lowered = raw.lower()
+            if lowered in end_candidates:
+                end_index = STEP_ORDER.index(lowered)
+                break
+        print("Invalid selection. Try again.", flush=True)
+
+    selected = STEP_ORDER[start_index : end_index + 1]
+    return tuple(selected)
 
 
 def _has_completed_step(checkpoints: CheckpointStore, episode_id: str, step: str) -> bool:
@@ -167,7 +250,67 @@ def _has_completed_step(checkpoints: CheckpointStore, episode_id: str, step: str
     if step == "diarize":
         path_str = details.get("rttm_path")
         return bool(path_str and Path(path_str).exists())
+    if step == "assign":
+        path_str = details.get("assignment_path") or payload.get("path")
+        return bool(path_str and Path(path_str).exists())
+    if step == "prettify":
+        path_str = details.get("readable_path") or payload.get("path")
+        return bool(path_str and Path(path_str).exists())
+    if step == "thematize":
+        path_str = details.get("themes_path") or payload.get("path")
+        return bool(path_str and Path(path_str).exists())
     return True
+
+
+def _validate_scope_requirements(
+    *,
+    episode_id: str,
+    plan: Optional[tuple[str, ...]],
+    checkpoints: CheckpointStore,
+) -> Optional[str]:
+    if not plan:
+        return None
+
+    def _ensure(condition: bool, message: str) -> Optional[str]:
+        return None if condition else message
+
+    requires_transcript = any(step in plan for step in ("diarize", "assign", "prettify", "thematize")) and "transcribe" not in plan
+    if requires_transcript:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "transcribe"),
+            "Selected scope requires a completed transcript. Run transcription first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    requires_diarization = any(step in plan for step in ("assign", "prettify", "thematize")) and "diarize" not in plan
+    if requires_diarization:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "diarize"),
+            "Selected scope requires completed diarization. Run diarization first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    requires_assignment = any(step in plan for step in ("prettify", "thematize")) and "assign" not in plan
+    if requires_assignment:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "assign"),
+            "Selected scope requires completed speaker assignments. Run assignment first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    requires_readable = "thematize" in plan and "prettify" not in plan
+    if requires_readable:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "prettify"),
+            "Thematize-only requires a readable transcript. Run prettify first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    return None
 
 
 def _completed_step_names(checkpoints: CheckpointStore, episode_id: str) -> set[str]:
@@ -181,7 +324,7 @@ def _completed_step_names(checkpoints: CheckpointStore, episode_id: str) -> set[
 def _prompt_resume_choice(episode: EpisodeViewState, completed: Sequence[str]) -> bool:
     completed_list = ", ".join(step.capitalize() for step in completed)
     print(
-        f"\nExisting checkpoints found for {episode.episode_id}: {completed_list}",
+        f"\nExisting checkpoints found for {episode.episode_key}: {completed_list}",
         flush=True,
     )
     print("Choose whether to resume from the last completed step or start over.", flush=True)
@@ -203,21 +346,25 @@ def prepare_execution_plan(
     completed = _completed_step_names(checkpoints, episode.episode_id)
     overlapping = tuple(step for step in desired_plan if step in completed)
     if not overlapping:
+        # No overlap with existing checkpoints, treat as fresh start
         return selected_steps, False
 
-    if _prompt_resume_choice(episode, overlapping):
-        remaining = tuple(step for step in desired_plan if step not in completed)
-        if remaining:
-            return remaining, True
+    # Auto-resume semantics: continue with steps not yet completed
+    remaining = tuple(step for step in desired_plan if step not in completed)
+    if remaining:
+        return remaining, True
+
+    # Everything in desired plan already completed; restart from scratch
+    if selected_steps is None:
         print(
             "All requested steps are already complete. Restarting pipeline from scratch.",
             flush=True,
         )
         checkpoints.delete_episode(episode.episode_id)
-        return (selected_steps if selected_steps is not None else None), False
-
-    checkpoints.delete_episode(episode.episode_id)
-    return (selected_steps if selected_steps is not None else None), False
+        return None, False
+    # For partial plans, honor the user's selection without wiping checkpoints
+    # so we do not unintentionally alter the plan based on status consistency checks.
+    return selected_steps, False
 
 
 def init_dependencies(config: MywConfig) -> tuple[CatalogService, PipelineRunner, QueueController]:
@@ -260,16 +407,40 @@ def main() -> int:
         return 0
 
     selected_steps, scope_label = select_pipeline_scope(episode, pipeline_runner.checkpoints)
-    steps, resume_requested = prepare_execution_plan(episode, selected_steps, pipeline_runner.checkpoints)
+    # Determine pipeline_id and handle consistency
+    pipeline_id: Optional[str]
+    if scope_label == "Full pipeline":
+        # Hard reset for full pipeline: wipe checkpoints and status, start from the beginning
+        pipeline_id = str(uuid4())
+        pipeline_runner.checkpoints.delete_pipeline(episode.episode_id, None)
+        steps = STEP_ORDER
+        resume_requested = False
+    else:
+        # Compute plan respecting existing artefacts
+        steps, resume_requested = prepare_execution_plan(episode, selected_steps, pipeline_runner.checkpoints)
+        status_row = pipeline_runner.checkpoints.get_pipeline_status(episode.episode_id)
+        pipeline_id = (status_row or {}).get("pipeline_id") if status_row else None
+        if not pipeline_id:
+            pipeline_id = str(uuid4())
+        # Consistency check: if last_completed_step is missing, restart from that step
+        if status_row and status_row.get("last_completed_step"):
+            last_completed = str(status_row["last_completed_step"])
+            cp = pipeline_runner.checkpoints.get_step(episode.episode_id, last_completed)
+            if not (cp and cp.status == "completed"):
+                print(f"Warning: Inconsistent pipeline state detected (missing checkpoint for {last_completed}). Restarting from that step.", flush=True)
+                if last_completed in STEP_ORDER:
+                    start_index = STEP_ORDER.index(last_completed)
+                    steps = STEP_ORDER[start_index:]
+                    resume_requested = True
     monitor = PipelineMonitor(episode.episode_id)
     pipeline_runner.callback = monitor
 
     pipeline_runner.start()
-    queue.enqueue(episode.episode_id, resume=resume_requested, steps=steps)
+    queue.enqueue(episode.episode_id, resume=resume_requested, steps=steps, pipeline_id=pipeline_id)
     status_label = f"{scope_label} (resume)" if resume_requested else scope_label
     queue.set_status(episode.episode_id, "In progress", f"Queued ({status_label})")
 
-    print(f"\nRunning {scope_label.lower()} for episode {episode.episode_id}...", flush=True)
+    print(f"\nRunning {scope_label.lower()} for episode {episode.episode_key}...", flush=True)
     try:
         monitor.wait()
     except KeyboardInterrupt:

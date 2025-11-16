@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Iterable, List, Optional
 
 from ...models import PodcastEpisode
@@ -30,8 +29,6 @@ class CatalogService:
         importer = ApplePodcastsImporter(
             cache_root=self.config.podcast_cache_path,
             catalog=self.catalog,
-            output_dir=self._audio_output_dir,
-            move=False,
             db_path=self.config.podcast_db_path,
         )
         episodes: List[PodcastEpisode] = []
@@ -47,12 +44,6 @@ class CatalogService:
     def list_view_states(self) -> List[EpisodeViewState]:
         episodes = list(self.catalog.list_episodes())
         return self._to_view_states(episodes)
-
-    @property
-    def _audio_output_dir(self) -> Path:
-        path = (self.config.data_dir / "audio").resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        return path
 
     def _to_view_states(self, episodes: Iterable[PodcastEpisode]) -> List[EpisodeViewState]:
         rows = [self._to_view_state(episode) for episode in episodes]

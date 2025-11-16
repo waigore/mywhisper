@@ -21,4 +21,5 @@ class PipelineCheckpoint:
     artefact_paths: Dict[str, str] = field(default_factory=dict)
     elapsed: Optional[float] = None
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    pipeline_id: Optional[str] = None
 
