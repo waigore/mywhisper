@@ -42,22 +42,22 @@ class FailingClient:
         raise RuntimeError("LLM offline")
 
 
-def test_thematizer_generates_and_merges_sections(tmp_path, monkeypatch):
-    config = ThematizeConfig(data_root=tmp_path / "data", max_tokens_per_chunk=5, chunk_overlap_ratio=0.2)
+def test_thematizer_generates_per_segment_summaries(tmp_path, monkeypatch):
+    config = ThematizeConfig(data_root=tmp_path / "data")
     episode = _episode(tmp_path)
-    readable_path = config.readable_path(episode)
-    readable_path.parent.mkdir(parents=True, exist_ok=True)
-    readable_path.write_text(
-        "Host (S0): Welcome to the show.\n\nHost (S0): Today we talk tech.\n\nGuest (S1): Tech is great.",
+    condensed_path = config.condensed_path(episode)
+    condensed_path.parent.mkdir(parents=True, exist_ok=True)
+    condensed_path.write_text(
+        json.dumps(
+            [
+                {"start": 0.0, "end": 1.0, "speaker_id": "S0", "speaker_name": "Host", "text": "Welcome to the show."},
+                {"start": 1.0, "end": 2.0, "speaker_id": "S1", "speaker_name": "Guest", "text": "Tech is great."},
+            ]
+        ),
         encoding="utf-8",
     )
 
     catalog = StubCatalog()
-    monkeypatch.setattr(
-        EpisodeThematizer,
-        "_chunk_transcript",
-        lambda self, text: ["chunk-1", "chunk-2"],
-    )
     thematizer = EpisodeThematizer(
         podcast=episode,
         config=config,
@@ -65,20 +65,20 @@ def test_thematizer_generates_and_merges_sections(tmp_path, monkeypatch):
         client=DummyClient(),  # type: ignore[arg-type]
     )
 
-    themes_path = thematizer.thematize(readable_path=readable_path)
+    themes_path = thematizer.thematize(condensed_path=condensed_path)
     assert themes_path.exists()
     payload = json.loads(themes_path.read_text(encoding="utf-8"))
     assert len(payload) == 2
-    assert "Additional intro" in payload[0]["summary"]
-    assert catalog.records and catalog.records[0][1] == "themes"
+    assert any(item.get("theme") for item in payload)
+    assert catalog.records and catalog.records[0][1] == "with_themes"
 
 
 def test_thematizer_fallback_on_failure(tmp_path):
     config = ThematizeConfig(data_root=tmp_path / "data")
     episode = _episode(tmp_path)
-    readable_path = config.readable_path(episode)
-    readable_path.parent.mkdir(parents=True, exist_ok=True)
-    readable_path.write_text("Host (S0): Nothing works today.", encoding="utf-8")
+    condensed_path = config.condensed_path(episode)
+    condensed_path.parent.mkdir(parents=True, exist_ok=True)
+    condensed_path.write_text(json.dumps([{"start": 0.0, "end": 1.0, "text": "Nothing works today."}]), encoding="utf-8")
 
     thematizer = EpisodeThematizer(
         podcast=episode,
@@ -87,7 +87,7 @@ def test_thematizer_fallback_on_failure(tmp_path):
         client=FailingClient(),  # type: ignore[arg-type]
     )
 
-    themes_path = thematizer.thematize(readable_path=readable_path)
+    themes_path = thematizer.thematize(condensed_path=condensed_path)
     payload = json.loads(themes_path.read_text(encoding="utf-8"))
     assert payload[0]["theme"] == config.fallback_theme
     assert "LLM fallback reason" in payload[0]["summary"]

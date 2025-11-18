@@ -274,7 +274,7 @@ def _validate_scope_requirements(
     def _ensure(condition: bool, message: str) -> Optional[str]:
         return None if condition else message
 
-    requires_transcript = any(step in plan for step in ("diarize", "assign", "prettify", "thematize")) and "transcribe" not in plan
+    requires_transcript = ("diarize" in plan) and "transcribe" not in plan
     if requires_transcript:
         warning = _ensure(
             _has_completed_step(checkpoints, episode_id, "transcribe"),
@@ -292,11 +292,11 @@ def _validate_scope_requirements(
         if warning:
             return warning
 
-    requires_assignment = any(step in plan for step in ("prettify", "thematize")) and "assign" not in plan
-    if requires_assignment:
+    requires_readable_for_assign = ("assign" in plan) and "prettify" not in plan
+    if requires_readable_for_assign:
         warning = _ensure(
-            _has_completed_step(checkpoints, episode_id, "assign"),
-            "Selected scope requires completed speaker assignments. Run assignment first or include it in the plan.",
+            _has_completed_step(checkpoints, episode_id, "prettify"),
+            "Assignment requires a readable transcript from prettify. Run prettify first or include it in the plan.",
         )
         if warning:
             return warning

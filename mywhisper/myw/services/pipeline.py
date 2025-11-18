@@ -44,7 +44,7 @@ def _serialize_dataclass(instance: Any) -> Dict[str, Any]:
 
 ProgressCallback = Callable[[PipelineProgress | PipelineStopped | PipelineCompleted], None]
 
-STEP_ORDER = ("transcribe", "diarize", "assign", "prettify", "thematize")
+STEP_ORDER = ("transcribe", "diarize", "prettify", "thematize", "assign")
 
 
 class PipelineInterrupted(Exception):
@@ -263,11 +263,11 @@ class PipelineRunner:
                         context.episode.episode_id,
                     )
                     diarization_results = self._run_diarization(context, transcript_segments, adapter)
-        elif "assign" in plan:
+        elif any(step in plan for step in ("prettify", "assign")):
             self._log_step_start(
                 context,
                 "diarize",
-                {"mode": "load_checkpoint", "reason": "assignment_requires_diarization"},
+                {"mode": "load_checkpoint", "reason": "downstream_step_requires_diarization"},
             )
             load_start = perf_counter()
             diarization_results = self._load_diarization_results(context)
@@ -286,60 +286,71 @@ class PipelineRunner:
 
         assignment_path: Optional[Path] = None
         readable_path: Optional[Path] = None
+        condensed_path: Optional[Path] = None
 
-        if (
-            "assign" in plan
-            and "assign" not in context.completed_steps
-            and transcript_segments is not None
-        ):
-            diarized_turns = self._ensure_diarized_turns(diarization_results)
-            if diarized_turns:
-                transcript_segments = self._apply_diarization_labels(transcript_segments, diarized_turns)
-            else:
-                LOGGER.warning(
-                    "No diarization turns available for %s; speaker IDs will remain unset.",
-                    context.episode.episode_id,
-                )
-            assigned_segments, derived_assignment_path = self._run_assignment(
-                context,
-                transcript_segments,
-                adapter,
-            )
-            if assigned_segments is not None:
-                transcript_segments = assigned_segments
-            assignment_path = derived_assignment_path or self._load_assignment_path(context)
-        elif any(step in plan for step in ("assign", "prettify", "thematize")):
-            assignment_path = self._load_assignment_path(context)
-
-        self._validate_assignment_availability(plan, assignment_path)
-        self._check_stop()
-
+        # Prettify (now before assign): requires diarization; formats readable from diarized segments/placeholders
         if "prettify" in plan:
             if "prettify" not in context.completed_steps:
-                if assignment_path is None:
-                    raise RuntimeError("Assignments are required for prettify.")
-                readable_path = self._run_prettify(context, adapter, assignment_path)
+                if transcript_segments is None:
+                    raise RuntimeError("Transcript segments are required to run prettify.")
+                diarized_turns = self._ensure_diarized_turns(diarization_results)
+                if diarized_turns:
+                    transcript_segments = self._apply_diarization_labels(transcript_segments, diarized_turns)
+                else:
+                    LOGGER.warning(
+                        "No diarization turns available for %s; speaker IDs will remain unset.",
+                        context.episode.episode_id,
+                    )
+                # Ensure a placeholder 'assignment-like' JSON exists so prettifier can operate deterministically
+                placeholder_assignment = self._ensure_placeholder_assignment(context, transcript_segments or [])
+                readable_path = self._run_prettify(context, adapter, placeholder_assignment)
+                condensed_path = self._load_condensed_path(context)
             else:
                 readable_path = self._load_readable_path(context)
+                condensed_path = self._load_condensed_path(context)
                 if not readable_path or not readable_path.exists():
                     LOGGER.warning(
                         "Readable transcript missing for %s; regenerating prettify output.",
                         context.episode.episode_id,
                     )
-                    if assignment_path is None:
-                        raise RuntimeError("Assignments are required for prettify.")
-                    readable_path = self._run_prettify(context, adapter, assignment_path)
-        elif "thematize" in plan:
+                    if transcript_segments is None:
+                        raise RuntimeError("Transcript segments are required to run prettify.")
+                    diarized_turns = self._ensure_diarized_turns(diarization_results)
+                    if diarized_turns:
+                        transcript_segments = self._apply_diarization_labels(transcript_segments, diarized_turns)
+                    placeholder_assignment = self._ensure_placeholder_assignment(context, transcript_segments or [])
+                    readable_path = self._run_prettify(context, adapter, placeholder_assignment)
+                    condensed_path = self._load_condensed_path(context)
+        elif "thematize" in plan or "assign" in plan:
             readable_path = self._load_readable_path(context)
+            condensed_path = self._load_condensed_path(context)
 
-        self._validate_readable_availability(plan, readable_path)
+        # Assign (now after prettify): requires a readable transcript
+        if "assign" in plan:
+            if "assign" not in context.completed_steps:
+                if not readable_path:
+                    readable_path = self._load_readable_path(context)
+                if not readable_path or not readable_path.exists():
+                    raise RuntimeError("Readable transcript is required for assignment. Run prettify first.")
+                # Perform name inference based on readable transcript and update artefacts
+                assigned_segments, derived_assignment_path = self._run_assignment_from_readable(
+                    context, adapter, readable_path
+                )
+                if assigned_segments is not None:
+                    transcript_segments = assigned_segments
+                assignment_path = derived_assignment_path or self._load_assignment_path(context)
+            else:
+                assignment_path = self._load_assignment_path(context)
+
+        # Validate artefacts for thematization
+        self._validate_condensed_availability(plan, condensed_path)
         self._check_stop()
 
         if "thematize" in plan:
             if "thematize" not in context.completed_steps:
-                if readable_path is None:
-                    raise RuntimeError("Readable transcript required for thematization.")
-                self._run_thematize(context, adapter, readable_path)
+                if condensed_path is None:
+                    raise RuntimeError("Condensed transcript required for thematization.")
+                self._run_thematize(context, adapter, condensed_path)
             else:
                 themes_path = self._load_themes_path(context)
                 if not themes_path or not themes_path.exists():
@@ -347,9 +358,9 @@ class PipelineRunner:
                         "Themes artefact missing for %s; regenerating thematization output.",
                         context.episode.episode_id,
                     )
-                    if readable_path is None:
-                        raise RuntimeError("Readable transcript required for thematization.")
-                    self._run_thematize(context, adapter, readable_path)
+                    if condensed_path is None:
+                        raise RuntimeError("Condensed transcript required for thematization.")
+                    self._run_thematize(context, adapter, condensed_path)
         self._check_stop()
 
     def _run_transcription(
@@ -509,6 +520,20 @@ class PipelineRunner:
                     return resolved
         return None
 
+    def _load_condensed_path(self, context: PipelineContext) -> Optional[Path]:
+        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "prettify")
+        if checkpoint and checkpoint.status == "completed":
+            path = checkpoint.details.get("condensed_path") or checkpoint.payload.get("condensed_path")
+            if path:
+                resolved = Path(path)
+                if resolved.exists():
+                    return resolved
+        # Fallback to any condensed path captured from recent events
+        fallback = getattr(self, "_last_condensed_path", None)
+        if isinstance(fallback, Path) and fallback.exists():
+            return fallback
+        return None
+
     def _load_themes_path(self, context: PipelineContext) -> Optional[Path]:
         checkpoint = self.checkpoints.get_step(context.episode.episode_id, "thematize")
         if checkpoint and checkpoint.status == "completed":
@@ -542,6 +567,45 @@ class PipelineRunner:
         start_time = perf_counter()
         assigner = TranscriptAssigner.from_config(context.episode, config)
         events = assigner.assign_names(segments, metadata=context.episode.metadata, yield_progress=True)
+        assignment = self._consume_events(context, adapter, "assign", events, context.step_plan)
+        elapsed = perf_counter() - start_time
+        self._log_step_end(
+            context,
+            "assign",
+            {
+                **self._assignment_summary(assignment),
+                "elapsed": round(elapsed, 2),
+                "source": "fresh",
+            },
+        )
+        assignment_path = getattr(assigner, "_last_assignment_path", None)
+        if assignment_path:
+            assignment_path = Path(assignment_path)
+        return assignment, assignment_path
+
+    def _run_assignment_from_readable(
+        self,
+        context: PipelineContext,
+        adapter: PipelineEventAdapter,
+        readable_path: Path,
+    ) -> tuple[Sequence[TranscriptSegment], Optional[Path]]:
+        config = AssignmentConfig(
+            data_root=self.config.data_dir,
+            ollama_model=self.config.ollama_model,
+            spacy_model=self.config.spacy_model,
+        )
+        self._log_step_start(
+            context,
+            "assign",
+            {
+                "mode": "execute",
+                "config": _serialize_dataclass(config),
+                "readable_path": str(readable_path),
+            },
+        )
+        start_time = perf_counter()
+        assigner = TranscriptAssigner.from_config(context.episode, config)
+        events = assigner.assign_from_readable(readable_path, metadata=context.episode.metadata, yield_progress=True)
         assignment = self._consume_events(context, adapter, "assign", events, context.step_plan)
         elapsed = perf_counter() - start_time
         self._log_step_end(
@@ -597,7 +661,7 @@ class PipelineRunner:
         self,
         context: PipelineContext,
         adapter: PipelineEventAdapter,
-        readable_path: Path,
+        condensed_path: Path,
     ) -> Path:
         config = ThematizeConfig(
             data_root=self.config.data_dir,
@@ -608,7 +672,7 @@ class PipelineRunner:
             "thematize",
             {
                 "mode": "execute",
-                "readable_path": str(readable_path),
+                "condensed_path": str(condensed_path),
             },
         )
         start_time = perf_counter()
@@ -617,7 +681,7 @@ class PipelineRunner:
             config=config,
             catalog=self.catalog,
         )
-        events = thematizer.thematize(readable_path=readable_path, yield_progress=True)
+        events = thematizer.thematize(condensed_path=condensed_path, yield_progress=True)
         themes_path = self._consume_events(context, adapter, "thematize", events, context.step_plan)
         elapsed = perf_counter() - start_time
         self._log_step_end(
@@ -658,6 +722,22 @@ class PipelineRunner:
         event: PipelineEvent,
         step_plan: Sequence[str],
     ) -> None:
+        # Capture condensed path from prettify events even if checkpoints are not persisted (useful in tests)
+        if step == "prettify":
+            try:
+                condensed_val = event.checkpoint.get("condensed_path")
+            except Exception:
+                condensed_val = None
+            if not condensed_val:
+                try:
+                    condensed_val = (event.artefact_paths or {}).get("condensed")
+                except Exception:
+                    condensed_val = None
+            if condensed_val:
+                try:
+                    self._last_condensed_path = Path(condensed_val)
+                except Exception:
+                    self._last_condensed_path = None
         if event.transient:
             self._check_stop()
             return
@@ -805,7 +885,7 @@ class PipelineRunner:
         return tuple(normalized)
 
     def _plan_requires_transcript(self, plan: Sequence[str]) -> bool:
-        return "transcribe" not in plan and any(step in ("diarize", "assign") for step in plan)
+        return "transcribe" not in plan and any(step in ("diarize",) for step in plan)
 
     def _validate_transcript_availability(
         self,
@@ -823,37 +903,38 @@ class PipelineRunner:
         completed_steps: Dict[str, str],
         diarization_results,
     ) -> None:
-        if "assign" not in plan:
+        if not any(step in plan for step in ("prettify", "assign")):
             return
+        # Allow if diarization will run in this plan or is already completed
         if "diarize" in plan or "diarize" in completed_steps:
             return
         if diarization_results is None:
             raise RuntimeError(
-                "Diarization results are required for assignment. Run diarization first or include it in the plan."
+                "Diarization results are required for prettify/assign. Include diarization before these steps."
             )
 
     def _validate_assignment_availability(
         self,
         plan: Sequence[str],
-        assignment_path: Optional[Path],
-    ) -> None:
-        if not any(step in plan for step in ("prettify", "thematize")):
-            return
-        if assignment_path is None or not assignment_path.exists():
-            raise RuntimeError(
-                "Speaker assignment artefact is required. Include the assignment step before prettify/thematize."
-            )
-
-    def _validate_readable_availability(
-        self,
-        plan: Sequence[str],
         readable_path: Optional[Path],
     ) -> None:
-        if "thematize" not in plan:
+        if "assign" not in plan:
             return
         if readable_path is None or not readable_path.exists():
             raise RuntimeError(
-                "Readable transcript artefact is required for thematization. Run prettify first or include it in the plan."
+                "Readable transcript artefact is required. Run prettify before assignment or include it in the plan."
+            )
+
+    def _validate_condensed_availability(
+        self,
+        plan: Sequence[str],
+        condensed_path: Optional[Path],
+    ) -> None:
+        if "thematize" not in plan:
+            return
+        if condensed_path is None or not condensed_path.exists():
+            raise RuntimeError(
+                "Condensed transcript artefact is required for thematization. Run prettify first or include it in the plan."
             )
 
     def _completion_message(self, plan: Sequence[str]) -> str:
@@ -931,7 +1012,7 @@ class PipelineRunner:
                     pipeline_id=status_row["pipeline_id"],
                     status="completed",
                     current_step="Completed",
-                    last_completed_step="thematize",
+                    last_completed_step="assign",
                     progress=1.0,
                     remarks=remarks,
                 )
@@ -1080,4 +1161,31 @@ class PipelineRunner:
                 updated_segments.append(seg)
 
         return updated_segments
+
+    def _ensure_placeholder_assignment(
+        self,
+        context: PipelineContext,
+        segments: Sequence[TranscriptSegment],
+    ) -> Path:
+        """
+        Persist a placeholder 'assigned transcript' JSON that contains diarized segments
+        with speaker_id placeholders and speaker_name mirroring the speaker_id. This allows
+        the existing prettifier to operate deterministically before real name assignment.
+        """
+        cfg = PrettifyConfig(data_root=self.config.data_dir)
+        assignment_path = cfg.assignment_path(context.episode, context.episode.episode_key).resolve()
+        assignment_path.parent.mkdir(parents=True, exist_ok=True)
+        records: list[dict] = []
+        for seg in segments:
+            records.append(
+                {
+                    "start": float(seg.start),
+                    "end": float(seg.end),
+                    "text": seg.text,
+                    "speaker_id": seg.speaker_id or "UNKNOWN",
+                    "speaker_name": seg.speaker_id or "UNKNOWN",
+                }
+            )
+        assignment_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        return assignment_path
 

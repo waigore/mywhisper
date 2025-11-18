@@ -448,6 +448,28 @@ class TranscriptAssigner:
         inference_engine = SpeakerInferenceEngine(config, engine_client)
         return cls(podcast=podcast, config=config, inference_engine=inference_engine)
 
+    def assign_from_readable(
+        self,
+        readable_path: Path,
+        metadata: Optional[Dict[str, str]] = None,
+        yield_progress: bool = False,
+    ) -> List[TranscriptSegment] | Generator[PipelineEvent, None, List[TranscriptSegment]]:
+        """
+        Accept a prettified transcript (readable .txt) and infer real speaker names.
+        This parses lines of the form '<label> (<speaker_id>): <text>' to reconstruct
+        segments grouped by speaker_id, performs name inference, persists the enriched
+        JSON assignment artefact, and updates the readable transcript labels with the
+        inferred names.
+        """
+        pipeline = self._assign_from_readable_pipeline(readable_path, metadata or {})
+        if yield_progress:
+            return pipeline
+        try:
+            while True:
+                next(pipeline)
+        except StopIteration as stop:
+            return stop.value
+
     def assign_names(
         self,
         segments: Sequence[TranscriptSegment],
@@ -712,6 +734,124 @@ class TranscriptAssigner:
         )
 
         return enriched_segments
+
+    def _assign_from_readable_pipeline(
+        self,
+        readable_path: Path,
+        metadata: Dict[str, str],
+    ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
+        episode_key = self.podcast.episode_key
+        start_time = time.perf_counter()
+        self.logger.info(
+            "Speaker assignment (from readable) started | episode=%s | readable=%s | config=%s",
+            self.podcast.episode_id,
+            readable_path,
+            self._config_snapshot(),
+        )
+
+        yield PipelineEvent(
+            stage="start",
+            step_name="assign",
+            episode_id=self.podcast.episode_id,
+            message=f"Parsing readable transcript for {self.podcast.episode_title}",
+            payload={
+                "episode_key": episode_key,
+                "readable_path": str(readable_path),
+                "step": "started",
+            },
+            checkpoint={
+                "status": "started",
+                "step": "assign",
+                "episode_key": episode_key,
+                "readable_path": str(readable_path),
+            },
+        )
+
+        segments = self._segments_from_readable(readable_path)
+        # Delegate to the core pipeline for inference + persistence
+        generator = self._assign_pipeline(segments, metadata)
+        enriched: Optional[List[TranscriptSegment]] = None
+        try:
+            while True:
+                event = next(generator)
+                yield event
+        except StopIteration as stop:
+            enriched = stop.value
+
+        # Update readable labels with inferred names
+        id_to_name: Dict[str, str] = {}
+        for seg in enriched or []:
+            sid = (seg.speaker_id or "").strip()
+            name = (seg.speaker_name or "").strip()
+            if sid and name:
+                id_to_name[sid] = name
+        if id_to_name:
+            self._rewrite_readable_labels(readable_path, id_to_name)
+            self.logger.info("Updated readable transcript labels with assigned names | %s", readable_path)
+            elapsed = time.perf_counter() - start_time
+            yield PipelineEvent(
+                stage="assign",
+                step_name="assign",
+                episode_id=self.podcast.episode_id,
+                message="Updated readable transcript with inferred speaker names",
+                payload={
+                    "readable_path": str(readable_path),
+                    "step": "readable_updated",
+                },
+                checkpoint={
+                    "status": "readable_updated",
+                    "step": "assign",
+                    "episode_key": episode_key,
+                    "readable_path": str(readable_path),
+                },
+                elapsed=elapsed,
+            )
+
+        return enriched or []
+
+    def _segments_from_readable(self, path: Path) -> List[TranscriptSegment]:
+        """
+        Parse a prettified transcript into approximate segments by speaker_id.
+        Each paragraph is treated as a segment; timestamps are not available.
+        """
+        lines = path.read_text(encoding="utf-8").splitlines()
+        segments: List[TranscriptSegment] = []
+        t = 0.0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            match = re.match(r"^(.*?)\s*\(([^)]+)\):\s*(.+)$", line)
+            if not match:
+                continue
+            _label, speaker_id, text = match.groups()
+            # Create a pseudo-duration to preserve ordering
+            start = t
+            duration = max(1.0, min(10.0, len(text) / 50.0))
+            end = start + duration
+            t = end
+            segments.append(
+                TranscriptSegment(
+                    start=start,
+                    end=end,
+                    text=text.strip(),
+                    speaker_id=speaker_id.strip(),
+                    speaker_name=speaker_id.strip(),
+                    confidence=None,
+                    justification=None,
+                    metadata={},
+                )
+            )
+        return segments
+
+    def _rewrite_readable_labels(self, path: Path, id_to_name: Dict[str, str]) -> None:
+        raw = path.read_text(encoding="utf-8")
+        def replace_label(match: "re.Match[str]") -> str:  # type: ignore[name-defined]
+            label, speaker_id = match.group(1), match.group(2)
+            new_name = id_to_name.get(speaker_id, label).strip() or label
+            return f"{new_name} ({speaker_id}):"
+        updated = re.sub(r"^(.*?)\s*\(([^)]+)\):", replace_label, raw, flags=re.MULTILINE)
+        path.write_text(updated, encoding="utf-8")
 
     def _config_snapshot(self) -> Dict[str, Any]:
         return {

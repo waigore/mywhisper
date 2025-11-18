@@ -25,6 +25,11 @@ class PrettifyConfig:
     max_block_characters: Optional[int] = None
     output_subdir: str = "transcripts"
 
+    def condensed_path(self, podcast: PodcastEpisode, episode_key: Optional[str] = None) -> Path:
+        key = episode_key or podcast.episode_key
+        directory = ensure_episode_subdir(key, self.data_root, self.output_subdir)
+        return directory / f"{key}_condensed.json"
+
     def assignment_path(self, podcast: PodcastEpisode, episode_key: Optional[str] = None) -> Path:
         key = episode_key or podcast.episode_key
         directory = ensure_episode_subdir(key, self.data_root, self.output_subdir)
@@ -84,6 +89,7 @@ class TranscriptPrettifier:
         resolved_assignment = assignment_path or self.config.assignment_path(self.podcast, episode_key)
         resolved_assignment = resolved_assignment.resolve()
         readable_path = self.config.readable_path(self.podcast, episode_key).resolve()
+        condensed_path = self.config.condensed_path(self.podcast, episode_key).resolve()
 
         if not resolved_assignment.exists():
             raise FileNotFoundError(f"Assigned transcript not found at {resolved_assignment}")
@@ -136,6 +142,27 @@ class TranscriptPrettifier:
             },
         )
 
+        # Persist condensed JSON (collapsed blocks)
+        condensed_records = [
+            {
+                "start": float(block.get("start", 0.0)),
+                "end": float(block.get("end", 0.0)),
+                "speaker_id": block.get("speaker_id") or "UNKNOWN",
+                "speaker_name": block.get("speaker_name") or (block.get("speaker_id") or "UNKNOWN"),
+                "text": " ".join(part.strip() for part in (block.get("texts") or []) if str(part).strip()),
+            }
+            for block in blocks
+            if block.get("texts")
+        ]
+        condensed_path.parent.mkdir(parents=True, exist_ok=True)
+        condensed_path.write_text(json.dumps(condensed_records, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.logger.info(
+            "Persisted condensed transcript | path=%s | blocks=%d",
+            condensed_path,
+            len(condensed_records),
+        )
+
+        # Persist readable text
         readable_text = self._format_blocks(blocks)
         readable_path.parent.mkdir(parents=True, exist_ok=True)
         readable_path.write_text(readable_text, encoding="utf-8")
@@ -145,6 +172,7 @@ class TranscriptPrettifier:
             len(blocks),
         )
 
+        # Record artefacts (readable first for backward-compat tests)
         artefact_key = f"{episode_key}_readable"
         if self.catalog:
             self.catalog.record_artefact(
@@ -153,23 +181,30 @@ class TranscriptPrettifier:
                 path=readable_path,
                 artefact_key=artefact_key,
             )
+            self.catalog.record_artefact(
+                episode_id=self.podcast.episode_id,
+                kind="condensed_transcript",
+                path=condensed_path,
+                artefact_key=f"{episode_key}_condensed",
+            )
 
         elapsed = time.perf_counter() - start_time
         yield PipelineEvent(
             stage="prettify",
             step_name="prettify",
             episode_id=self.podcast.episode_id,
-            message="Persisted readable transcript",
+            message="Persisted condensed and readable transcripts",
             payload={
                 "path": str(readable_path),
                 "blocks": len(blocks),
                 "step": "completed",
             },
-            artefact_paths={"readable": readable_path},
+            artefact_paths={"readable": readable_path, "condensed": condensed_path},
             checkpoint={
                 "status": "completed",
                 "step": "prettify",
                 "readable_path": str(readable_path),
+                "condensed_path": str(condensed_path),
                 "blocks": len(blocks),
                 "assignment_path": str(resolved_assignment),
                 "episode_key": episode_key,
@@ -179,6 +214,7 @@ class TranscriptPrettifier:
 
         self._last_assignment_path = resolved_assignment
         self._last_readable_path = readable_path
+        self._last_condensed_path = condensed_path
         return readable_path
 
     def _load_segments(self, path: Path) -> List[TranscriptSegment]:

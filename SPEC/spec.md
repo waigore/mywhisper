@@ -1,7 +1,7 @@
 ## MyWhisper Specification
 
 ### Purpose
-`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → label speakers → prettify → thematize) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
+`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → prettify → thematize → assign) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
 
 ---
 
@@ -45,23 +45,28 @@
 - Key classes: `DiarizationConfig` (HF token, device, output dirs), `WaveformLoader`, `PyAnnotePipelineFactory`, `DiarizationPipeline`.
 - Artefacts: `{episode_key}.rttm`, optional `{episode_key}_diarization.json`.
 
+### Prettify Step
+- Module: `mywhisper/prettify.py` exporting `PrettifyConfig` + `TranscriptPrettifier`.
+- Collapse contiguous segments (speaker match, ≤`collapse_gap_seconds` pause, `max_block_characters` guard), format using placeholder speaker identifiers from diarization (e.g., `SPEAKER_0: <text>`), and write two artefacts:
+  - `{episode_key}_readable.txt` (human-readable transcript)
+  - `{episode_key}_condensed.json` (JSON array of collapsed blocks with fields `start,end,speaker_id,speaker_name,text`)
+- Register artefact kinds `readable_transcript` and `condensed_transcript` via `PodcastCatalog.record_artefact(...)` and emit generator-driven `PipelineEvent(stage="prettify", step_name="prettify")` for load/collapse/persist.
+- Config knobs: `data_root`, `collapse_gap_seconds` (default 1.5 s), optional `max_block_characters`, output subdir override.
+
 ### `mywhisper/assign`
 - Responsibilities: merge transcripts + diarization, build speaker profiles, gather candidate names, drive LLM-based inference (default Ollama), and persist `{episode_key}_with_names.json`.
 - Key classes: `AssignmentConfig`, `SpeakerProfileBuilder`, `CandidateRoster`, `LLMClient`/`OllamaClient`, `SpeakerInferenceEngine`.
 - Behaviour: enforce confidence threshold (fallback `"UNKNOWN"`), support iterative refinement, expose generator progress hooks.
 - Artefacts: enriched transcript JSON, optional CSV analytics export.
 
-### Prettify Step
-- Module: `mywhisper/prettify.py` exporting `PrettifyConfig` + `TranscriptPrettifier`.
-- Collapse contiguous segments (speaker match, ≤`collapse_gap_seconds` pause, `max_block_characters` guard), format as `<speaker name> (<speaker_id>): <text>`, and write `{episode_key}_readable.txt`.
-- Register artefact kind `readable_transcript` via `PodcastCatalog.record_artefact(...)` and emit generator-driven `PipelineEvent(stage="prettify", step_name="prettify")` for load/collapse/persist.
-- Config knobs: `data_root`, `collapse_gap_seconds` (default 1.5 s), optional `max_block_characters`, output subdir override.
-
 ### Thematize Step
 - Module: `mywhisper/thematize.py` exposing `ThematizeConfig` + `EpisodeThematizer`.
-- Ingest readable transcript, normalize into ≤2 000-token chunks with ~15 % overlap, prompt configurable LLM (`llm_model`, default Ollama) using templated instructions, and parse JSON `[{"theme","summary","highlights"}]` payloads.
-- Merge adjacent identical themes, persist `{episode_key}_themes.json`, register artefact kind `themes`, and emit `PipelineEvent(stage="thematize")` per chunk plus final persist event (checkpoint includes `themes_path`).
-- On LLM failure or empty transcript, fall back to a single `fallback_theme` section summarizing the transcript snippet + failure reason.
+- Ingest the condensed JSON produced by the prettify step. Iterate per speaker-collapsed segment (no overlap, no token windowing). For each segment, prompt a configurable LLM (`llm_model`, default Ollama) for:
+  - `"theme"`: short title (≤6 words)
+  - `"summary"`: concise description up to 50 words
+- Persist `{episode_key}_with_themes.json` as an array mirroring each condensed segment and adding `theme` and `summary`. Do not merge adjacent identical themes; each segment receives its own summary.
+- Register artefact kind `with_themes` and emit `PipelineEvent(stage="thematize")` per segment plus final persist event (checkpoint includes `themes_path`).
+- On LLM failure or empty transcript, fall back to a single section using a general episode overview.
 
 ### `mywhisper/podcasts`
 - Responsibilities: index cache-resident episodes, expose queries (by show title, GUID, date, path), and orchestrate ingestion without copying audio.
@@ -75,9 +80,9 @@
 1. **Discover** episodes via `ApplePodcastsImporter`, store metadata + cache paths in `PodcastCatalog`.
 2. **Transcribe** using `PodcastTranscriber`; reuse cached chunks and save `{episode_key}_whisper.json`.
 3. **Diarize** through `DiarizationPipeline`, writing `{episode_key}.rttm` and optional diarization JSON.
-4. **Assign speakers** via `SpeakerInferenceEngine`, yielding `{episode_key}_with_names.json`.
-5. **Prettify** to readable text blocks.
-6. **Thematize** into structured topic sections.
+4. **Prettify** diarized segments into readable text blocks and a condensed JSON of collapsed segments.
+5. **Thematize** by segment using the condensed JSON, yielding `{episode_key}_with_themes.json`.
+6. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
 
 Each stage resumes from artefacts identified by the episode key and records outputs in the catalog for traceability.
 
@@ -107,7 +112,7 @@ Each stage resumes from artefacts identified by the episode key and records outp
 ## CLI Resume Semantics and Persistence
 - CLI offers three scopes: Full pipeline (from beginning), Resume pipeline (only when not fully completed), and Partial pipeline (user-selected start and end).
 - Resume starts at the next pending step and runs through the end.
-- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → assign → prettify → thematize`).
+- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → prettify → thematize → assign`).
   - Constraint: the starting step must be at or before the current in-progress step recorded in `pipeline_status.current_step` for the episode (when present). If no active `current_step`, any step can be chosen as the start.
   - Constraint: the ending step must be at or after the selected starting step. If start equals end, only that step runs.
   - Artefact prerequisites still apply when skipping steps; validations ensure required artefacts exist (or the user must include the producing step in the selection).

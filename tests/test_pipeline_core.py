@@ -155,32 +155,30 @@ def test_should_reset_checkpoints_logic(tmp_path):
 
 def test_validation_helpers_raise_as_expected(tmp_path):
     runner = build_runner(tmp_path)
-    # transcript required by diarize/assign when transcribe not in plan
+    # transcript required by diarize when transcribe not in plan
     with pytest.raises(RuntimeError):
-        runner._validate_transcript_availability(("assign",), None)
+        runner._validate_transcript_availability(("diarize",), None)
 
-    # diarization required for assign unless already in completed
+    # diarization required for prettify/assign unless already in completed
     with pytest.raises(RuntimeError):
-        runner._validate_diarization_availability(("assign",), {}, None)
+        runner._validate_diarization_availability(("prettify",), {}, None)
     # ok when diarize planned
-    runner._validate_diarization_availability(("assign", "diarize"), {}, None)
+    runner._validate_diarization_availability(("prettify", "diarize"), {}, None)
     # ok when diarize completed
     runner._validate_diarization_availability(("assign",), {"diarize": "completed"}, None)
 
-    # assignment artefact required for prettify/thematize
+    # readable required for assign
     with pytest.raises(RuntimeError):
-        runner._validate_assignment_availability(("prettify",), None)
-    with pytest.raises(RuntimeError):
-        runner._validate_assignment_availability(("thematize",), None)
+        runner._validate_assignment_availability(("assign",), None)
 
-    # readable required for thematize
+    # condensed required for thematize
     with pytest.raises(RuntimeError):
-        runner._validate_readable_availability(("thematize",), None)
+        runner._validate_condensed_availability(("thematize",), None)
 
 
 def test_progress_for_and_completion_message(tmp_path):
     runner = build_runner(tmp_path)
-    plan = ("transcribe", "diarize", "assign")
+    plan = ("transcribe", "diarize", "prettify")
     dummy_event = PipelineEvent(
         stage="progress",
         step_name="transcribe",
@@ -205,7 +203,7 @@ def test_progress_for_and_completion_message(tmp_path):
     # completion message defaults
     assert runner._completion_message(STEP_ORDER) == "Pipeline completed"
     assert runner._completion_message(("diarize",)) == "Diarization complete"
-    assert "Assign, Prettify" in runner._completion_message(("assign", "prettify"))
+    assert "Prettify, Assign" in runner._completion_message(("prettify", "assign"))
 
 
 def test_ensure_diarized_turns_handles_list_dicts_and_rttm(tmp_path):

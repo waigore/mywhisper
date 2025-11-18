@@ -365,3 +365,47 @@ def test_random_resolution_when_tie_persists(tmp_path, monkeypatch):
     }
     assert len(set(speaker_names.values())) == 2
 
+
+def test_assign_from_readable_updates_labels(tmp_path, monkeypatch):
+    config = AssignmentConfig(data_root=tmp_path / "data")
+    episode = PodcastEpisode(
+        episode_id="ep-read",
+        show_title="Show",
+        episode_title="Episode",
+        source_path=tmp_path / "audio.wav",
+    )
+    readable_dir = (tmp_path / "data" / episode.episode_key / "transcripts")
+    readable_dir.mkdir(parents=True, exist_ok=True)
+    readable_path = readable_dir / f"{episode.episode_key}_readable.txt"
+    readable_path.write_text("SPEAKER_00 (SPEAKER_00): Hello\n\nSPEAKER_01 (SPEAKER_01): Hi", encoding="utf-8")
+
+    # Engine guesses deterministic names for both speakers
+    engine = StubEngine(
+        guesses=make_guesses(
+            {
+                "SPEAKER_00": [("Alice", 0.9)],
+                "SPEAKER_01": [("Bob", 0.8)],
+            }
+        )
+    )
+    assigner = TranscriptAssigner(podcast=episode, config=config, inference_engine=engine)
+    monkeypatch.setattr(CandidateRoster, "compile", lambda self, *_args, **_kwargs: ["Alice", "Bob"])
+
+    # Run as generator to simulate pipeline consumption
+    gen = assigner.assign_from_readable(readable_path, yield_progress=True)
+    try:
+        while True:
+            next(gen)  # exhaust events
+    except StopIteration as stop:
+        enriched = stop.value
+
+    # Check enriched segments carry names
+    names = {seg.speaker_id: seg.speaker_name for seg in enriched}
+    assert names["SPEAKER_00"] == "Alice"
+    assert names["SPEAKER_01"] == "Bob"
+
+    # Readable labels should be updated with inferred names
+    updated = readable_path.read_text(encoding="utf-8")
+    assert "Alice (SPEAKER_00): Hello" in updated
+    assert "Bob (SPEAKER_01): Hi" in updated
+

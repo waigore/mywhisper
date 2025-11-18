@@ -174,7 +174,7 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         episode=episode,
         resume=False,
         completed_steps={},
-        step_plan=("transcribe", "diarize", "assign", "prettify", "thematize"),
+        step_plan=("transcribe", "diarize", "prettify", "thematize", "assign"),
     )
 
     transcript_segments = [
@@ -214,7 +214,9 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
     assignment_path.write_text("[]")
     readable_path = tmp_path / "readable.txt"
     readable_path.write_text("Host (S0): Hello")
-    themes_path = tmp_path / "themes.json"
+    condensed_path = tmp_path / "condensed.json"
+    condensed_path.write_text('[{"start":0.0,"end":1.0,"speaker_id":"S0","speaker_name":"Host","text":"Hello"}]')
+    themes_path = tmp_path / "with_themes.json"
     themes_path.write_text("[]")
 
     class StubAssigner:
@@ -237,6 +239,9 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
                 return assigned_segments
 
             return generator()
+        def assign_from_readable(self, readable_path: Path, metadata=None, yield_progress: bool = True):
+            # Mirror assign_names behavior for this stub, ignoring readable input
+            return self.assign_names([], metadata=metadata, yield_progress=yield_progress)
 
     class StubPrettifier:
         def __init__(self, *args, **kwargs):
@@ -253,8 +258,9 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
                     checkpoint={
                         "status": "completed",
                         "readable_path": str(readable_path),
+                        "condensed_path": str(condensed_path),
                     },
-                    artefact_paths={"readable": readable_path},
+                    artefact_paths={"readable": readable_path, "condensed": condensed_path},
                 )
                 return readable_path
 
@@ -264,7 +270,7 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         def __init__(self, *args, **kwargs):
             pass
 
-        def thematize(self, readable_path: Path | None = None, yield_progress: bool = True):
+        def thematize(self, condensed_path: Path | None = None, yield_progress: bool = True):
             def generator():
                 yield PipelineEvent(
                     stage="thematize",
@@ -275,9 +281,9 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
                     checkpoint={
                         "status": "completed",
                         "themes_path": str(themes_path),
-                        "readable_path": str(readable_path),
+                        "condensed_path": str(condensed_path),
                     },
-                    artefact_paths={"themes": themes_path},
+                    artefact_paths={"with_themes": themes_path},
                 )
                 return themes_path
 
@@ -372,7 +378,7 @@ def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path)
         episode=episode,
         resume=True,
         completed_steps={"transcribe": "completed", "diarize": "completed"},
-        step_plan=("transcribe", "diarize", "assign"),
+        step_plan=("transcribe", "diarize", "prettify", "assign"),
     )
 
     class StubAssigner:
@@ -388,10 +394,37 @@ def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path)
                 return segments
 
             return generator()
+        def assign_from_readable(self, readable_path: Path, metadata=None, yield_progress: bool = True):
+            return self.assign_names([], metadata=metadata, yield_progress=yield_progress)
+
+    class StubPrettifier:
+        def __init__(self, *args, **kwargs):
+            pass
+        def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
+            def generator():
+                rp = Path(str(assignment_path).replace("_with_names.json", "_readable.txt"))
+                rp.parent.mkdir(parents=True, exist_ok=True)
+                rp.write_text("Readable content", encoding="utf-8")
+                yield PipelineEvent(
+                    stage="prettify",
+                    step_name="prettify",
+                    episode_id=episode.episode_id,
+                    message="prettified",
+                    payload={"step": "completed"},
+                    checkpoint={"status": "completed", "readable_path": str(rp)},
+                    artefact_paths={"readable": rp},
+                )
+                return rp
+
+            return generator()
 
     monkeypatch.setattr(
         "mywhisper.myw.services.pipeline.TranscriptAssigner.from_config",
         classmethod(lambda cls, episode, config: StubAssigner()),
+    )
+    monkeypatch.setattr(
+        "mywhisper.myw.services.pipeline.TranscriptPrettifier",
+        StubPrettifier,
     )
 
     runner._process_episode(context)
