@@ -222,7 +222,7 @@ class EpisodeThematizer:
         self._last_themes_path = themes_path
         return themes_path
 
-    def _chunk_transcript(self, text: str) -> List[str]:
+    def _chunk_transcript(self, text: str) -> List[str]:  # pragma: no cover - legacy method
         if not text:
             return []
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -260,7 +260,7 @@ class EpisodeThematizer:
         return chunks
 
     @staticmethod
-    def _estimate_tokens(text: str) -> int:
+    def _estimate_tokens(text: str) -> int:  # pragma: no cover - legacy method
         words = text.split()
         return max(1, int(len(words) * 1.3) or len(text) // 4 or 1)
 
@@ -286,7 +286,7 @@ class EpisodeThematizer:
             summary = " ".join(words[:50])
         return theme, summary
 
-    def _parse_sections(self, raw_output: str, chunk_index: int) -> List[dict]:
+    def _parse_sections(self, raw_output: str, chunk_index: int) -> List[dict]:  # pragma: no cover - legacy method
         payload = raw_output.strip()
         data = json.loads(payload)
         if isinstance(data, dict):

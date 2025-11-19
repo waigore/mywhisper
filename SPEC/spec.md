@@ -1,7 +1,7 @@
 ## MyWhisper Specification
 
 ### Purpose
-`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → prettify → thematize → assign) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
+`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → prettify → thematize → classify → assign) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
 
 ---
 
@@ -10,6 +10,7 @@
 - `mywhisper/transcribe.py` Whisper pipelines
 - `mywhisper/diarize.py` PyAnnote diarization
 - `mywhisper/assign.py` speaker naming
+- `mywhisper/classify.py` content classification
 - `mywhisper/podcasts.py` Apple Podcasts catalog + importer
 - `mywhisper/config.py` shared config helpers
 - Tests mirror the package under `tests/`
@@ -68,6 +69,17 @@
 - Register artefact kind `with_themes` and emit `PipelineEvent(stage="thematize")` per segment plus final persist event (checkpoint includes `themes_path`).
 - On LLM failure or empty transcript, fall back to a single section using a general episode overview.
 
+### Classify Step
+- Module: `mywhisper/classify.py` exposing `ClassifyConfig` + `EpisodeClassifier`.
+- Ingest the thematized JSON produced by the thematize step. For each segment, use zero-shot classification to identify non-editorial content (ads, sponsorships, promos, intros, outros).
+- Process each segment's text:
+  - If text ≤ 300 words: classify the entire segment as one chunk
+  - If text > 300 words: split into sentence-based chunks of at most 300 words each, classify each chunk individually
+- Collect all distinct classifications if chunks differ in top label.
+- Persist `{episode_key}_classified.json` as an array mirroring each thematized segment and adding `classifications` field (array of `{"label": str, "score": float, "is_non_editorial": bool}`).
+- Register artefact kind `classified` and emit `PipelineEvent(stage="classify")` per segment plus final persist event (checkpoint includes `classified_path`).
+- Classification uses `transformers.pipeline("zero-shot-classification")` with model `MoritzLaurer/deberta-v3-large-zeroshot-v2.0` and candidate labels: "podcast advertisement or sponsorship", "promo or call-to-action", "episode intro or outro filler", "main editorial content".
+
 ### `mywhisper/podcasts`
 - Responsibilities: index cache-resident episodes, expose queries (by show title, GUID, date, path), and orchestrate ingestion without copying audio.
 - Storage: SQLite `data/catalog.db` with `episodes` and `artefacts` tables; artefact keys reuse the episode key stub.
@@ -82,7 +94,8 @@
 3. **Diarize** through `DiarizationPipeline`, writing `{episode_key}.rttm` and optional diarization JSON.
 4. **Prettify** diarized segments into readable text blocks and a condensed JSON of collapsed segments.
 5. **Thematize** by segment using the condensed JSON, yielding `{episode_key}_with_themes.json`.
-6. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
+6. **Classify** segments using zero-shot classification to identify non-editorial content, yielding `{episode_key}_classified.json`.
+7. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
 
 Each stage resumes from artefacts identified by the episode key and records outputs in the catalog for traceability.
 
@@ -112,7 +125,7 @@ Each stage resumes from artefacts identified by the episode key and records outp
 ## CLI Resume Semantics and Persistence
 - CLI offers three scopes: Full pipeline (from beginning), Resume pipeline (only when not fully completed), and Partial pipeline (user-selected start and end).
 - Resume starts at the next pending step and runs through the end.
-- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → prettify → thematize → assign`).
+- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → prettify → thematize → classify → assign`).
   - Constraint: the starting step must be at or before the current in-progress step recorded in `pipeline_status.current_step` for the episode (when present). If no active `current_step`, any step can be chosen as the start.
   - Constraint: the ending step must be at or after the selected starting step. If start equals end, only that step runs.
   - Artefact prerequisites still apply when skipping steps; validations ensure required artefacts exist (or the user must include the producing step in the selection).

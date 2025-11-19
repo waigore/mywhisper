@@ -259,6 +259,9 @@ def _has_completed_step(checkpoints: CheckpointStore, episode_id: str, step: str
     if step == "thematize":
         path_str = details.get("themes_path") or payload.get("path")
         return bool(path_str and Path(path_str).exists())
+    if step == "classify":
+        path_str = details.get("classified_path") or payload.get("path")
+        return bool(path_str and Path(path_str).exists())
     return True
 
 
@@ -306,6 +309,15 @@ def _validate_scope_requirements(
         warning = _ensure(
             _has_completed_step(checkpoints, episode_id, "prettify"),
             "Thematize-only requires a readable transcript. Run prettify first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    requires_themes = "classify" in plan and "thematize" not in plan
+    if requires_themes:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "thematize"),
+            "Classification requires a thematized transcript. Run thematize first or include it in the plan.",
         )
         if warning:
             return warning

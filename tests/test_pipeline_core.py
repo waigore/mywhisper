@@ -175,6 +175,10 @@ def test_validation_helpers_raise_as_expected(tmp_path):
     with pytest.raises(RuntimeError):
         runner._validate_condensed_availability(("thematize",), None)
 
+    # themes required for classify
+    with pytest.raises(RuntimeError):
+        runner._validate_themes_availability(("classify",), None)
+
 
 def test_progress_for_and_completion_message(tmp_path):
     runner = build_runner(tmp_path)
@@ -204,6 +208,7 @@ def test_progress_for_and_completion_message(tmp_path):
     assert runner._completion_message(STEP_ORDER) == "Pipeline completed"
     assert runner._completion_message(("diarize",)) == "Diarization complete"
     assert "Prettify, Assign" in runner._completion_message(("prettify", "assign"))
+    assert runner._completion_message(("classify",)) == "Classification complete"
 
 
 def test_ensure_diarized_turns_handles_list_dicts_and_rttm(tmp_path):
@@ -309,5 +314,121 @@ def test_check_stop_raises_when_flagged(tmp_path):
     queue._should_stop = True
     with pytest.raises(PipelineInterrupted):
         runner._check_stop()
+
+
+def test_load_classified_path(tmp_path):
+    """Test loading classified path from checkpoint."""
+    runner = build_runner(tmp_path)
+    episode = PodcastEpisode(episode_id="ep", show_title="s", episode_title="e", source_path=tmp_path / "a.wav")
+    context = PipelineContext(episode=episode, resume=False, completed_steps={}, step_plan=("classify",))
+
+    # No checkpoint
+    assert runner._load_classified_path(context) is None
+
+    # With checkpoint
+    checkpoints = InMemoryCheckpointStore()
+    classified_file = tmp_path / "classified.json"
+    classified_file.write_text('[]')
+    checkpoints.upsert(
+        PipelineCheckpoint(
+            episode_id="ep",
+            step="classify",
+            status="completed",
+            stage="persisted",
+            message="done",
+            details={"classified_path": str(classified_file)},
+        )
+    )
+    runner.checkpoints = checkpoints
+    result = runner._load_classified_path(context)
+    assert result == classified_file
+
+
+def test_load_themes_path(tmp_path):
+    """Test loading themes path from checkpoint."""
+    runner = build_runner(tmp_path)
+    episode = PodcastEpisode(episode_id="ep", show_title="s", episode_title="e", source_path=tmp_path / "a.wav")
+    context = PipelineContext(episode=episode, resume=False, completed_steps={}, step_plan=("thematize",))
+
+    # No checkpoint
+    assert runner._load_themes_path(context) is None
+
+    # With checkpoint
+    checkpoints = InMemoryCheckpointStore()
+    themes_file = tmp_path / "themes.json"
+    themes_file.write_text('[]')
+    checkpoints.upsert(
+        PipelineCheckpoint(
+            episode_id="ep",
+            step="thematize",
+            status="completed",
+            stage="persisted",
+            message="done",
+            details={"themes_path": str(themes_file)},
+        )
+    )
+    runner.checkpoints = checkpoints
+    result = runner._load_themes_path(context)
+    assert result == themes_file
+
+
+def test_load_themes_path_from_payload(tmp_path):
+    """Test loading themes path from payload when details missing."""
+    runner = build_runner(tmp_path)
+    episode = PodcastEpisode(episode_id="ep", show_title="s", episode_title="e", source_path=tmp_path / "a.wav")
+    context = PipelineContext(episode=episode, resume=False, completed_steps={}, step_plan=("thematize",))
+
+    checkpoints = InMemoryCheckpointStore()
+    themes_file = tmp_path / "themes.json"
+    themes_file.write_text('[]')
+    checkpoints.upsert(
+        PipelineCheckpoint(
+            episode_id="ep",
+            step="thematize",
+            status="completed",
+            stage="persisted",
+            message="done",
+            payload={"path": str(themes_file)},
+        )
+    )
+    runner.checkpoints = checkpoints
+    result = runner._load_themes_path(context)
+    assert result == themes_file
+
+
+def test_resolve_step_plan_includes_classify(tmp_path):
+    """Test that classify step is included in STEP_ORDER."""
+    runner = build_runner(tmp_path)
+    from mywhisper.myw.services.queue import QueueItem
+
+    # Test that classify is in STEP_ORDER
+    assert "classify" in STEP_ORDER
+    assert STEP_ORDER.index("classify") > STEP_ORDER.index("thematize")
+    assert STEP_ORDER.index("classify") < STEP_ORDER.index("assign")
+
+    # Test that classify can be resolved
+    item = QueueItem("ep1", steps=("classify",))
+    assert runner._resolve_step_plan(item) == ("classify",)
+
+
+def test_plan_requires_transcript(tmp_path):
+    """Test _plan_requires_transcript logic."""
+    runner = build_runner(tmp_path)
+    # diarize requires transcript if transcribe not in plan
+    assert runner._plan_requires_transcript(("diarize",)) is True
+    # transcribe in plan -> no requirement
+    assert runner._plan_requires_transcript(("transcribe", "diarize")) is False
+    # classify doesn't require transcript directly
+    assert runner._plan_requires_transcript(("classify",)) is False
+
+
+def test_validate_diarization_availability_with_classify(tmp_path):
+    """Test that classify step doesn't require diarization."""
+    runner = build_runner(tmp_path)
+    # classify doesn't require diarization
+    runner._validate_diarization_availability(("classify",), {}, None)
+    # But prettify/assign do
+    with pytest.raises(RuntimeError):
+        runner._validate_diarization_availability(("prettify",), {}, None)
 
 

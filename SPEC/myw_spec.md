@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- Provide a terminal-native Textual UI (`myw.py`) that manages podcast catalogs and runs the full mywhisper pipeline (transcribe → diarize → prettify → assign → thematize).
+- Provide a terminal-native Textual UI (`myw.py`) that manages podcast catalogs and runs the full mywhisper pipeline (transcribe → diarize → prettify → thematize → classify → assign).
 - Wrap generator-driven jobs in a responsive, non-blocking experience while matching existing CLI capabilities.
 
 ## Guiding Principles
@@ -70,12 +70,14 @@ Business logic resides in services; UI components remain thin/testable.
   1. Transcribe (Whisper)
   2. Diarize (PyAnnote)
   3. Prettify (format diarized segments into a readable transcript with placeholder speaker IDs, e.g. `SPEAKER_0`)
-  4. Assign (LLM-produced real speaker names; consumes the prettified transcript and updates names in the readable)
-  5. Thematize (turn readable transcript into `_themes.json`)
+  4. Thematize (turn readable transcript into `_themes.json`)
+  5. Classify (zero-shot classification to identify non-editorial content, producing `_classified.json`)
+  6. Assign (LLM-produced real speaker names; consumes the prettified transcript and updates names in the readable)
 - Stage gating:
   - Prettify requires diarization artefacts.
+  - Thematize requires a condensed transcript produced by prettify.
+  - Classify requires a thematized transcript produced by thematize.
   - Assign requires a readable transcript produced by prettify.
-  - Thematize requires a readable transcript; prefer the post-assign readable when available, otherwise use the pre-assign readable.
   Missing artefacts trigger automatic reloads from checkpoints (or regeneration) before progressing.
 - After every step, persist checkpoints, update artefact registry, send Textual progress messages, and refresh listing remarks/progress bar.
 - Stop/resume:
@@ -107,7 +109,7 @@ Business logic resides in services; UI components remain thin/testable.
   - Resume pipeline (only shown if the episode is not fully completed)
   - Partial pipeline (choose starting and ending steps)
 - Partial pipeline behavior:
-  - Steps are chosen from the canonical order: `transcribe`, `diarize`, `prettify`, `assign`, `thematize`.
+  - Steps are chosen from the canonical order: `transcribe`, `diarize`, `prettify`, `thematize`, `classify`, `assign`.
   - Starting step is constrained to be at or before the current in-progress step in `pipeline_status.current_step` (when present). If no current step, any step can be selected.
   - Ending step must be at or after the starting step. If the same, only that step runs.
   - Artefact prerequisites still apply when skipping steps (e.g., thematize requires a readable transcript); the CLI validates selected ranges and prompts to adjust if prerequisites are not met.
