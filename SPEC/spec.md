@@ -1,7 +1,7 @@
 ## MyWhisper Specification
 
 ### Purpose
-`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → prettify → thematize → classify → assign) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
+`mywhisper` delivers reproducible podcast-processing pipelines (transcribe → diarize → prettify → thematize → classify → vocative → assign) driven by a cached Apple Podcasts catalog. Every stage reuses the original cache file, keeps artefacts deterministic, and emits progress through generators for batch or interactive control.
 
 ---
 
@@ -9,8 +9,11 @@
 - `mywhisper/__init__.py` bootstrap + exports
 - `mywhisper/transcribe.py` Whisper pipelines
 - `mywhisper/diarize.py` PyAnnote diarization
-- `mywhisper/assign.py` speaker naming
+- `mywhisper/prettify.py` transcript formatting
+- `mywhisper/thematize.py` theme generation
 - `mywhisper/classify.py` content classification
+- `mywhisper/vocative.py` vocative detection
+- `mywhisper/assign.py` speaker naming
 - `mywhisper/podcasts.py` Apple Podcasts catalog + importer
 - `mywhisper/config.py` shared config helpers
 - Tests mirror the package under `tests/`
@@ -36,12 +39,14 @@
 
 ## Module Requirements
 
-### `mywhisper/transcribe`
+### Transcribe Step
+- Module: `mywhisper/transcribe.py` exporting `TranscriptionConfig` + `PodcastTranscriber`.
 - Responsibilities: normalize cached audio (downmix + resample), invoke Whisper.cpp models, persist transcripts as `{episode_key}_whisper.json`, and optionally reuse cached segments.
 - Key classes: `TranscriptionConfig` (paths, language, chunking, device), `WhisperModelFactory`, `AudioChunker`, and `PodcastTranscriber`.
 - Artefacts: chunk WAVs (only when chunking), transcript JSON aligned with example schema.
 
-### `mywhisper/diarize`
+### Diarize Step
+- Module: `mywhisper/diarize.py` exporting `DiarizationConfig` + `DiarizationPipeline`.
 - Responsibilities: run PyAnnote end-to-end on the cache file, surface `ProgressHook` updates, write RTTM plus optional diarization JSON.
 - Key classes: `DiarizationConfig` (HF token, device, output dirs), `WaveformLoader`, `PyAnnotePipelineFactory`, `DiarizationPipeline`.
 - Artefacts: `{episode_key}.rttm`, optional `{episode_key}_diarization.json`.
@@ -54,7 +59,8 @@
 - Register artefact kinds `readable_transcript` and `condensed_transcript` via `PodcastCatalog.record_artefact(...)` and emit generator-driven `PipelineEvent(stage="prettify", step_name="prettify")` for load/collapse/persist.
 - Config knobs: `data_root`, `collapse_gap_seconds` (default 1.5 s), optional `max_block_characters`, output subdir override.
 
-### `mywhisper/assign`
+### Assign Step
+- Module: `mywhisper/assign.py` exporting `AssignmentConfig` + `TranscriptAssigner`.
 - Responsibilities: merge transcripts + diarization, build speaker profiles, gather candidate names, drive LLM-based inference (default Ollama), and persist `{episode_key}_with_names.json`.
 - Key classes: `AssignmentConfig`, `SpeakerProfileBuilder`, `CandidateRoster`, `LLMClient`/`OllamaClient`, `SpeakerInferenceEngine`.
 - Behaviour: enforce confidence threshold (fallback `"UNKNOWN"`), support iterative refinement, expose generator progress hooks.
@@ -80,6 +86,38 @@
 - Register artefact kind `classified` and emit `PipelineEvent(stage="classify")` per segment plus final persist event (checkpoint includes `classified_path`).
 - Classification uses `transformers.pipeline("zero-shot-classification")` with model `MoritzLaurer/deberta-v3-large-zeroshot-v2.0` and candidate labels: "podcast advertisement or sponsorship", "promo or call-to-action", "episode intro or outro filler", "main editorial content".
 
+### Vocative Step
+- Module: `mywhisper/vocative.py` exposing `VocativeConfig` + `EpisodeVocativeDetector`.
+- Ingest the classified JSON produced by the classify step. For each segment, detect direct named addresses (vocatives) using a two-stage process: rule-based detection followed by LLM classification.
+- Process each segment's text:
+  - **Stage 1 - Rule-based detection:**
+    - Parse text with SpaCy to extract sentences, tokens, and NER entities
+    - Extract PERSON entities using Named Entity Recognition
+    - Apply punctuation-based heuristics to identify vocative candidates:
+      - Case 1: Name at sentence beginning, followed by punctuation, then verb
+      - Case 2: Name at sentence end, preceded by punctuation
+      - Case 3: Name in the middle, surrounded by punctuation (e.g., "..., Josh, ...")
+    - Return all identified candidates (may be multiple per segment)
+  - **Stage 2 - LLM classification:**
+    - For each vocative candidate identified by rule-based detection, find all occurrences of that name within the segment
+    - For each occurrence separately:
+      - Extract the sentence containing that specific occurrence (only the surrounding sentence, not the full segment)
+      - Prompt an LLM to determine whether this occurrence is serving as a vocative (direct address) or some other linguistic function
+      - LLM returns classification: "VOCATIVE" (direct address) or "OTHER" (other linguistic function)
+    - If LLM is unavailable, returns invalid response, or sentence extraction fails, default classification is "UNKNOWN"
+    - All candidates (VOCATIVE, OTHER, and UNKNOWN) are included in the output, with each occurrence of the same name tracked separately
+  - Add `addressed_person_candidates` field (array of candidate objects) to each segment. Each candidate object has:
+    - `name`: string - the name of the candidate
+    - `classification`: string - either "VOCATIVE", "OTHER", or "UNKNOWN"
+    - `justification`: string - explanation for the classification decision
+    - `sentence`: string - the sentence text that was used for classification
+  - Multiple occurrences of the same name within a segment result in multiple separate entries, each with its own classification based on its context
+  - Empty array when no candidates are found
+- Persist `{episode_key}_vocative.json` as an array mirroring each classified segment and adding `addressed_person_candidates` field.
+- Register artefact kind `vocative` and emit `PipelineEvent(stage="vocative")` per segment plus final persist event (checkpoint includes `vocative_path`).
+- Uses SpaCy model (default `en_core_web_sm`) for NER and dependency parsing.
+- Uses LLM client (default Ollama with `llama3` model) for classification. LLM configuration is exposed via `VocativeConfig` (`llm_model`, `llm_endpoint`).
+
 ### `mywhisper/podcasts`
 - Responsibilities: index cache-resident episodes, expose queries (by show title, GUID, date, path), and orchestrate ingestion without copying audio.
 - Storage: SQLite `data/catalog.db` with `episodes` and `artefacts` tables; artefact keys reuse the episode key stub.
@@ -95,7 +133,8 @@
 4. **Prettify** diarized segments into readable text blocks and a condensed JSON of collapsed segments.
 5. **Thematize** by segment using the condensed JSON, yielding `{episode_key}_with_themes.json`.
 6. **Classify** segments using zero-shot classification to identify non-editorial content, yielding `{episode_key}_classified.json`.
-7. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
+7. **Detect vocatives** by segment using SpaCy NER and dependency parsing with punctuation-based heuristics, followed by LLM classification, yielding `{episode_key}_vocative.json` with `addressed_person_candidates` field.
+8. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
 
 Each stage resumes from artefacts identified by the episode key and records outputs in the catalog for traceability.
 
@@ -125,7 +164,7 @@ Each stage resumes from artefacts identified by the episode key and records outp
 ## CLI Resume Semantics and Persistence
 - CLI offers three scopes: Full pipeline (from beginning), Resume pipeline (only when not fully completed), and Partial pipeline (user-selected start and end).
 - Resume starts at the next pending step and runs through the end.
-- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → prettify → thematize → classify → assign`).
+- Partial pipeline lets the user choose a starting step and ending step from the canonical order (`transcribe → diarize → prettify → thematize → classify → vocative → assign`).
   - Constraint: the starting step must be at or before the current in-progress step recorded in `pipeline_status.current_step` for the episode (when present). If no active `current_step`, any step can be chosen as the start.
   - Constraint: the ending step must be at or after the selected starting step. If start equals end, only that step runs.
   - Artefact prerequisites still apply when skipping steps; validations ensure required artefacts exist (or the user must include the producing step in the selection).

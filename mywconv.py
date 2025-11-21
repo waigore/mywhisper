@@ -262,6 +262,9 @@ def _has_completed_step(checkpoints: CheckpointStore, episode_id: str, step: str
     if step == "classify":
         path_str = details.get("classified_path") or payload.get("path")
         return bool(path_str and Path(path_str).exists())
+    if step == "vocative":
+        path_str = details.get("vocative_path") or payload.get("path")
+        return bool(path_str and Path(path_str).exists())
     return True
 
 
@@ -318,6 +321,15 @@ def _validate_scope_requirements(
         warning = _ensure(
             _has_completed_step(checkpoints, episode_id, "thematize"),
             "Classification requires a thematized transcript. Run thematize first or include it in the plan.",
+        )
+        if warning:
+            return warning
+
+    requires_classified = "vocative" in plan and "classify" not in plan
+    if requires_classified:
+        warning = _ensure(
+            _has_completed_step(checkpoints, episode_id, "classify"),
+            "Vocative detection requires a classified transcript. Run classify first or include it in the plan.",
         )
         if warning:
             return warning
@@ -435,7 +447,9 @@ def main() -> int:
         if not pipeline_id:
             pipeline_id = str(uuid4())
         # Consistency check: if last_completed_step is missing, restart from that step
-        if status_row and status_row.get("last_completed_step"):
+        # Only apply this check when user hasn't explicitly selected a partial pipeline
+        # (i.e., when it's a resume scenario, not a partial pipeline selection)
+        if selected_steps is None and status_row and status_row.get("last_completed_step"):
             last_completed = str(status_row["last_completed_step"])
             cp = pipeline_runner.checkpoints.get_step(episode.episode_id, last_completed)
             if not (cp and cp.status == "completed"):

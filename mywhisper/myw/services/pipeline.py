@@ -17,6 +17,7 @@ from ...podcasts import PodcastCatalog
 from ...prettify import PrettifyConfig, TranscriptPrettifier
 from ...thematize import EpisodeThematizer, ThematizeConfig
 from ...transcribe import PodcastTranscriber, TranscriptionConfig
+from ...vocative import EpisodeVocativeDetector, VocativeConfig
 from ..config import MywConfig
 from ..messages import PipelineCompleted, PipelineEventPayload, PipelineProgress, PipelineStopped
 from ..models import PipelineStatus
@@ -45,7 +46,7 @@ def _serialize_dataclass(instance: Any) -> Dict[str, Any]:
 
 ProgressCallback = Callable[[PipelineProgress | PipelineStopped | PipelineCompleted], None]
 
-STEP_ORDER = ("transcribe", "diarize", "prettify", "thematize", "classify", "assign")
+STEP_ORDER = ("transcribe", "diarize", "prettify", "thematize", "classify", "vocative", "assign")
 
 
 class PipelineInterrupted(Exception):
@@ -183,7 +184,9 @@ class PipelineRunner:
         plan = context.step_plan
         transcript_segments: Optional[Sequence[TranscriptSegment]] = None
         if "transcribe" in plan:
-            if "transcribe" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "transcribe" not in context.completed_steps or not context.resume
+            if should_run:
                 transcript_segments = self._run_transcription(context, adapter)
             else:
                 self._log_step_start(
@@ -235,7 +238,9 @@ class PipelineRunner:
 
         diarization_results = None
         if "diarize" in plan:
-            if "diarize" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "diarize" not in context.completed_steps or not context.resume
+            if should_run:
                 diarization_results = self._run_diarization(context, transcript_segments, adapter)
             else:
                 self._log_step_start(
@@ -291,7 +296,9 @@ class PipelineRunner:
 
         # Prettify (now before assign): requires diarization; formats readable from diarized segments/placeholders
         if "prettify" in plan:
-            if "prettify" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "prettify" not in context.completed_steps or not context.resume
+            if should_run:
                 if transcript_segments is None:
                     raise RuntimeError("Transcript segments are required to run prettify.")
                 diarized_turns = self._ensure_diarized_turns(diarization_results)
@@ -328,7 +335,9 @@ class PipelineRunner:
 
         # Assign (now after prettify): requires a readable transcript
         if "assign" in plan:
-            if "assign" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "assign" not in context.completed_steps or not context.resume
+            if should_run:
                 if not readable_path:
                     readable_path = self._load_readable_path(context)
                 if not readable_path or not readable_path.exists():
@@ -349,7 +358,9 @@ class PipelineRunner:
 
         themes_path: Optional[Path] = None
         if "thematize" in plan:
-            if "thematize" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "thematize" not in context.completed_steps or not context.resume
+            if should_run:
                 if condensed_path is None:
                     raise RuntimeError("Condensed transcript required for thematization.")
                 themes_path = self._run_thematize(context, adapter, condensed_path)
@@ -372,7 +383,9 @@ class PipelineRunner:
         self._check_stop()
 
         if "classify" in plan:
-            if "classify" not in context.completed_steps:
+            # When resume=False, re-run even if step is completed
+            should_run = "classify" not in context.completed_steps or not context.resume
+            if should_run:
                 if themes_path is None:
                     raise RuntimeError("Thematized transcript required for classification.")
                 self._run_classify(context, adapter, themes_path)
@@ -386,6 +399,38 @@ class PipelineRunner:
                     if themes_path is None:
                         raise RuntimeError("Thematized transcript required for classification.")
                     self._run_classify(context, adapter, themes_path)
+        self._check_stop()
+
+        # Validate classified artefact for vocative detection
+        self._validate_classified_availability(plan, context.completed_steps)
+        self._check_stop()
+
+        vocative_path: Optional[Path] = None
+        if "vocative" in plan:
+            # When resume=False, re-run even if step is completed
+            should_run = "vocative" not in context.completed_steps or not context.resume
+            if should_run:
+                classified_path = self._load_classified_path(context)
+                if classified_path is None:
+                    raise RuntimeError("Classified transcript required for vocative detection.")
+                vocative_path = self._run_vocative(context, adapter, classified_path)
+            else:
+                vocative_path = self._load_vocative_path(context)
+                if not vocative_path or not vocative_path.exists():
+                    LOGGER.warning(
+                        "Vocative artefact missing for %s; regenerating vocative detection output.",
+                        context.episode.episode_id,
+                    )
+                    classified_path = self._load_classified_path(context)
+                    if classified_path is None:
+                        raise RuntimeError("Classified transcript required for vocative detection.")
+                    vocative_path = self._run_vocative(context, adapter, classified_path)
+        elif "assign" in plan:
+            vocative_path = self._load_vocative_path(context)
+        self._check_stop()
+
+        # Validate vocative artefact for assignment (if needed)
+        self._validate_vocative_availability(plan, vocative_path)
         self._check_stop()
 
     def _run_transcription(  # pragma: no cover - complex integration path
@@ -765,6 +810,55 @@ class PipelineRunner:
                     return resolved
         return None
 
+    def _run_vocative(  # pragma: no cover - complex integration path
+        self,
+        context: PipelineContext,
+        adapter: PipelineEventAdapter,
+        classified_path: Path,
+    ) -> Path:
+        config = VocativeConfig(
+            data_root=self.config.data_dir,
+            spacy_model=self.config.spacy_model,
+            llm_model=self.config.ollama_model,
+        )
+        self._log_step_start(
+            context,
+            "vocative",
+            {
+                "mode": "execute",
+                "classified_path": str(classified_path),
+            },
+        )
+        start_time = perf_counter()
+        detector = EpisodeVocativeDetector(
+            podcast=context.episode,
+            config=config,
+            catalog=self.catalog,
+        )
+        events = detector.detect_vocatives(classified_path=classified_path, yield_progress=True)
+        vocative_path = self._consume_events(context, adapter, "vocative", events, context.step_plan)
+        elapsed = perf_counter() - start_time
+        self._log_step_end(
+            context,
+            "vocative",
+            {
+                "path": str(vocative_path),
+                "elapsed": round(elapsed, 2),
+                "source": "fresh",
+            },
+        )
+        return vocative_path
+
+    def _load_vocative_path(self, context: PipelineContext) -> Optional[Path]:
+        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "vocative")
+        if checkpoint and checkpoint.status == "completed":
+            path = checkpoint.details.get("vocative_path") or checkpoint.payload.get("path")
+            if path:
+                resolved = Path(path)
+                if resolved.exists():
+                    return resolved
+        return None
+
     def _consume_events(
         self,
         context: PipelineContext,
@@ -1019,6 +1113,29 @@ class PipelineRunner:
                 "Thematized transcript artefact is required for classification. Run thematize first or include it in the plan."
             )
 
+    def _validate_classified_availability(
+        self,
+        plan: Sequence[str],
+        completed_steps: Dict[str, str],
+    ) -> None:
+        if "vocative" not in plan:
+            return
+        # Allow if classify will run in this plan or is already completed
+        if "classify" in plan or "classify" in completed_steps:
+            return
+        # Check if classified path exists from checkpoint
+        # This is a soft check - actual validation happens in _run_vocative
+        pass
+
+    def _validate_vocative_availability(
+        self,
+        plan: Sequence[str],
+        vocative_path: Optional[Path],
+    ) -> None:
+        # Vocative is optional for assign step, so we don't require it
+        # This validation can be used in the future if needed
+        pass
+
     def _completion_message(self, plan: Sequence[str]) -> str:
         normalized = list(plan) or list(STEP_ORDER)
         if tuple(normalized) == STEP_ORDER:
@@ -1032,6 +1149,7 @@ class PipelineRunner:
                 "prettify": "Prettify complete",
                 "thematize": "Thematization complete",
                 "classify": "Classification complete",
+                "vocative": "Vocative detection complete",
             }
             return mapping.get(step, f"{step.title()} complete")
         pretty = ", ".join(step.title() for step in normalized)
