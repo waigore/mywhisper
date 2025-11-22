@@ -19,6 +19,7 @@ from pyannote.core import Annotation
 from tqdm.auto import tqdm
 
 from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import DiarizedTurn, PodcastEpisode, TranscriptSegment
 
 LOGGER = logging.getLogger("mywhisper.diarize")
@@ -54,7 +55,7 @@ class DiarizationConfig:
         }
 
 
-class WaveformLoader:
+class WaveformLoader(LoggingBase):
     """
     Normalize podcast audio into the waveform dict expected by PyAnnote.
     """
@@ -184,7 +185,7 @@ class PyAnnotePipelineFactory:
         return pipeline
 
 
-class DiarizationPipeline:
+class DiarizationPipeline(LoggingBase):
     """
     Orchestrates diarization workflow.
     """

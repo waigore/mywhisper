@@ -12,6 +12,7 @@ import spacy
 
 from .assign import LLMClient, OllamaClient
 from .config import ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode
 from .podcasts import PodcastCatalog
 
@@ -57,7 +58,7 @@ class VocativeConfig:
         return directory / f"{key}_vocative.json"
 
 
-class EpisodeVocativeDetector:
+class EpisodeVocativeDetector(LoggingBase):
     """
     Detect direct named addresses (vocatives) in podcast segments using SpaCy NER and dependency parsing.
     """

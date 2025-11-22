@@ -8,20 +8,23 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from ...assign import AssignmentConfig, TranscriptAssigner
 from ...checkpoints import PipelineEventAdapter, CheckpointStore, PipelineCheckpoint
-from ...classify import ClassifyConfig, EpisodeClassifier
-from ...diarize import DiarizationConfig, DiarizationPipeline
 from ...models import DiarizedTurn, PipelineEvent, PodcastEpisode, TranscriptSegment
 from ...podcasts import PodcastCatalog
-from ...prettify import PrettifyConfig, TranscriptPrettifier
-from ...thematize import EpisodeThematizer, ThematizeConfig
-from ...transcribe import PodcastTranscriber, TranscriptionConfig
-from ...vocative import EpisodeVocativeDetector, VocativeConfig
 from ..config import MywConfig
 from ..messages import PipelineCompleted, PipelineEventPayload, PipelineProgress, PipelineStopped
 from ..models import PipelineStatus
 from .queue import QueueController, QueueItem
+from .steps import (
+    STEP_ORDER,
+    extract_step_outputs,
+    get_step,
+    load_step_artefact,
+    load_step_path,
+    load_step_path_with_key,
+    map_outputs_to_dependencies,
+    validate_step_availability,
+)
 
 LOGGER = logging.getLogger("mywhisper.myw.pipeline")
 
@@ -46,8 +49,6 @@ def _serialize_dataclass(instance: Any) -> Dict[str, Any]:
 
 ProgressCallback = Callable[[PipelineProgress | PipelineStopped | PipelineCompleted], None]
 
-STEP_ORDER = ("transcribe", "diarize", "prettify", "thematize", "classify", "vocative", "assign")
-
 
 class PipelineInterrupted(Exception):
     """Raised when a stop is requested."""
@@ -60,6 +61,38 @@ class PipelineContext:
     completed_steps: Dict[str, str]
     step_plan: tuple[str, ...]
     pipeline_id: Optional[str] = None
+
+
+@dataclass
+class PipelineState:
+    """
+    State object to track step outputs during pipeline execution.
+    
+    This dataclass defines the standardized dependency keys that steps use
+    to communicate with each other. Each field corresponds to a dependency
+    key that downstream steps expect:
+    
+    - transcript_segments: Output from transcribe step
+    - diarization_results: Output from diarize step (RTTM path)
+    - readable_path: Output from prettify step
+    - condensed_path: Output from prettify step
+    - assignment_path: Output from assign step
+    - themes_path: Output from thematize step
+    - classified_path: Output from classify step
+    - vocative_path: Output from vocative step
+    
+    The mapping from step outputs to these dependency keys is defined
+    by each step's get_output_dependencies() method.
+    """
+
+    transcript_segments: Optional[Sequence[TranscriptSegment]] = None
+    diarization_results: Optional[Any] = None
+    assignment_path: Optional[Path] = None
+    readable_path: Optional[Path] = None
+    condensed_path: Optional[Path] = None
+    themes_path: Optional[Path] = None
+    classified_path: Optional[Path] = None
+    vocative_path: Optional[Path] = None
 
 
 class PipelineRunner:
@@ -174,7 +207,13 @@ class PipelineRunner:
             finally:
                 self.queue.release_current()
 
-    def _process_episode(self, context: PipelineContext) -> None:  # pragma: no cover - complex integration path
+    def _process_episode(self, context: PipelineContext) -> None:
+        """
+        Process an episode through the pipeline steps.
+        
+        This method orchestrates step execution generically, delegating all
+        step-specific logic to the steps themselves.
+        """
         adapter = PipelineEventAdapter(
             self.checkpoints,
             episode_id=context.episode.episode_id,
@@ -182,682 +221,271 @@ class PipelineRunner:
         )
 
         plan = context.step_plan
-        transcript_segments: Optional[Sequence[TranscriptSegment]] = None
-        if "transcribe" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "transcribe" not in context.completed_steps or not context.resume
+        # Track step outputs for dependency resolution
+        step_outputs: Dict[str, Any] = {}
+
+        # Iterate through steps in canonical order
+        for step_name in STEP_ORDER:
+            # Skip if step not in plan (unless needed by downstream steps)
+            step = get_step(step_name, self.config)
+            
+            # Check if step should run
+            should_run = step.should_run(plan, context.completed_steps, context.resume)
+            
+            # Load dependencies for this step
+            dependencies = step.load_dependencies(self.checkpoints, context.episode.episode_id, context)
+            
+            # Merge step_outputs into dependencies using standardized contracts
+            # Map outputs from all previously executed steps to their dependency keys
+            for prev_step_name in STEP_ORDER:
+                if prev_step_name in step_outputs and STEP_ORDER.index(prev_step_name) < STEP_ORDER.index(step_name):
+                    prev_step = get_step(prev_step_name, self.config)
+                    dependency_mapping = map_outputs_to_dependencies(prev_step_name, step_outputs, prev_step)
+                    dependencies.update(dependency_mapping)
+            
+            # Check if step is needed (in plan or required by downstream steps)
+            step_needed = step_name in plan
+            if not step_needed:
+                # Check if any downstream step needs this step's output
+                downstream_steps = [s for s in STEP_ORDER if STEP_ORDER.index(s) > STEP_ORDER.index(step_name)]
+                for downstream in downstream_steps:
+                    if downstream in plan:
+                        downstream_step = get_step(downstream, self.config)
+                        if step_name in downstream_step.get_dependencies(plan):
+                            step_needed = True
+                            break
+            
+            # Guard clause: handle steps that aren't needed
+            if not step_needed:
+                # Step is needed by downstream but not in plan - just load artefact if available
+                artefact = step.load_artefact(self.checkpoints, context.episode.episode_id)
+                if artefact:
+                    extracted = extract_step_outputs(
+                        step_name,
+                        artefact,
+                        step,
+                    )
+                    step_outputs.update(extracted)
+                # Continue to validation
+                self._validate_and_check_stop(step_name, step_outputs, plan, context)
+                continue
+            
+            # Step is needed - handle execution or checkpoint loading
+            in_plan = step_name in plan
+            
+            # Guard clause: handle steps not in plan
+            if not in_plan:
+                # Step needed but not in plan - load from checkpoint
+                artefact, extracted = self._load_step_from_checkpoint(context, step_name, step)
+                if artefact:
+                    step_outputs.update(extracted)
+                # Continue to validation
+                self._validate_and_check_stop(step_name, step_outputs, plan, context)
+                continue
+            
+            # Step is in plan - prepare inputs and execute or load
+            # Prepare inputs for execution
+            try:
+                inputs = step.prepare_inputs(context, dependencies, **step_outputs)
+            except RuntimeError as e:
+                raise
+            
+            # Guard clause: execute if should_run
             if should_run:
-                transcript_segments = self._run_transcription(context, adapter)
-            else:
-                self._log_step_start(
+                # Execute the step
+                extracted = self._execute_step(
                     context,
-                    "transcribe",
-                    {
-                        "mode": "load_checkpoint",
-                        "checkpoint_status": context.completed_steps["transcribe"],
-                    },
+                    adapter,
+                    step_name,
+                    step,
+                    inputs,
+                    plan,
+                    step_outputs,
                 )
-                load_start = perf_counter()
-                transcript_segments = self._load_transcript_segments(context)
-                load_elapsed = perf_counter() - load_start
-                self._log_step_end(
+                step_outputs.update(extracted)
+                # Continue to validation
+                self._validate_and_check_stop(step_name, step_outputs, plan, context)
+                continue
+            
+            # Not should_run - try to load from checkpoint
+            artefact, extracted = self._load_step_from_checkpoint(context, step_name, step)
+            
+            # Guard clause: handle checkpoint missing
+            if artefact is None:
+                # Checkpoint missing, need to rerun
+                LOGGER.warning(
+                    "%s checkpoint missing for %s; rerunning step",
+                    step_name,
+                    context.episode.episode_id,
+                )
+                # Rerun the step (inputs already prepared above)
+                extracted = self._execute_step(
                     context,
-                    "transcribe",
-                    {
-                        **self._transcript_summary(transcript_segments),
-                        "source": "checkpoint",
-                        "elapsed": round(load_elapsed, 2),
-                    },
+                    adapter,
+                    step_name,
+                    step,
+                    inputs,
+                    plan,
+                    step_outputs,
+                    extra_log_data={"reason": "checkpoint_missing"},
                 )
-                if transcript_segments is None:
-                    LOGGER.warning(
-                        "Transcript checkpoint missing for %s; rerunning transcription",
-                        context.episode.episode_id,
-                    )
-                    transcript_segments = self._run_transcription(context, adapter)
-        elif self._plan_requires_transcript(plan):
-            self._log_step_start(
-                context,
-                "transcribe",
-                {"mode": "load_checkpoint", "reason": "downstream_step_requires_transcript"},
-            )
-            load_start = perf_counter()
-            transcript_segments = self._load_transcript_segments(context)
-            load_elapsed = perf_counter() - load_start
-            self._log_step_end(
-                context,
-                "transcribe",
-                {
-                    **self._transcript_summary(transcript_segments),
-                    "source": "checkpoint",
-                    "elapsed": round(load_elapsed, 2),
-                },
-            )
-        self._validate_transcript_availability(plan, transcript_segments)
-        self._check_stop()
-
-        diarization_results = None
-        if "diarize" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "diarize" not in context.completed_steps or not context.resume
-            if should_run:
-                diarization_results = self._run_diarization(context, transcript_segments, adapter)
+                step_outputs.update(extracted)
             else:
-                self._log_step_start(
-                    context,
-                    "diarize",
-                    {
-                        "mode": "load_checkpoint",
-                        "checkpoint_status": context.completed_steps["diarize"],
-                    },
-                )
-                load_start = perf_counter()
-                diarization_results = self._load_diarization_results(context)
-                load_elapsed = perf_counter() - load_start
-                self._log_step_end(
-                    context,
-                    "diarize",
-                    {
-                        **self._diarization_summary(diarization_results),
-                        "source": "checkpoint",
-                        "elapsed": round(load_elapsed, 2),
-                    },
-                )
-                if diarization_results is None:
-                    LOGGER.warning(
-                        "Diarization checkpoint missing for %s; rerunning diarization",
-                        context.episode.episode_id,
-                    )
-                    diarization_results = self._run_diarization(context, transcript_segments, adapter)
-        elif any(step in plan for step in ("prettify", "assign")):
-            self._log_step_start(
-                context,
-                "diarize",
-                {"mode": "load_checkpoint", "reason": "downstream_step_requires_diarization"},
-            )
-            load_start = perf_counter()
-            diarization_results = self._load_diarization_results(context)
-            load_elapsed = perf_counter() - load_start
-            self._log_step_end(
-                context,
-                "diarize",
-                {
-                    **self._diarization_summary(diarization_results),
-                    "source": "checkpoint",
-                    "elapsed": round(load_elapsed, 2),
-                },
-            )
-        self._validate_diarization_availability(plan, context.completed_steps, diarization_results)
+                # Successfully loaded from checkpoint
+                step_outputs.update(extracted)
+            
+            # Validate step availability
+            self._validate_and_check_stop(step_name, step_outputs, plan, context)
+
+    def _validate_and_check_stop(
+        self,
+        step_name: str,
+        step_outputs: Dict[str, Any],
+        plan: Sequence[str],
+        context: PipelineContext,
+    ) -> None:
+        """Validate step and check for stop request."""
+        validation_kwargs = self._get_validation_kwargs(step_name, step_outputs, context)
+        validate_step_availability(step_name, plan, myw_config=self.config, completed_steps=context.completed_steps, **validation_kwargs)
+        self._validate_downstream_artefacts(step_name, step_outputs, plan, context)
         self._check_stop()
 
-        assignment_path: Optional[Path] = None
-        readable_path: Optional[Path] = None
-        condensed_path: Optional[Path] = None
-
-        # Prettify (now before assign): requires diarization; formats readable from diarized segments/placeholders
-        if "prettify" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "prettify" not in context.completed_steps or not context.resume
-            if should_run:
-                if transcript_segments is None:
-                    raise RuntimeError("Transcript segments are required to run prettify.")
-                diarized_turns = self._ensure_diarized_turns(diarization_results)
-                if diarized_turns:
-                    transcript_segments = self._apply_diarization_labels(transcript_segments, diarized_turns)
-                else:
-                    LOGGER.warning(
-                        "No diarization turns available for %s; speaker IDs will remain unset.",
-                        context.episode.episode_id,
-                    )
-                # Ensure a placeholder 'assignment-like' JSON exists so prettifier can operate deterministically
-                placeholder_assignment = self._ensure_placeholder_assignment(context, transcript_segments or [])
-                readable_path = self._run_prettify(context, adapter, placeholder_assignment)
-                condensed_path = self._load_condensed_path(context)
-            else:
-                readable_path = self._load_readable_path(context)
-                condensed_path = self._load_condensed_path(context)
-                if not readable_path or not readable_path.exists():
-                    LOGGER.warning(
-                        "Readable transcript missing for %s; regenerating prettify output.",
-                        context.episode.episode_id,
-                    )
-                    if transcript_segments is None:
-                        raise RuntimeError("Transcript segments are required to run prettify.")
-                    diarized_turns = self._ensure_diarized_turns(diarization_results)
-                    if diarized_turns:
-                        transcript_segments = self._apply_diarization_labels(transcript_segments, diarized_turns)
-                    placeholder_assignment = self._ensure_placeholder_assignment(context, transcript_segments or [])
-                    readable_path = self._run_prettify(context, adapter, placeholder_assignment)
-                    condensed_path = self._load_condensed_path(context)
-        elif "thematize" in plan or "assign" in plan:
-            readable_path = self._load_readable_path(context)
-            condensed_path = self._load_condensed_path(context)
-
-        # Assign (now after prettify): requires a readable transcript
-        if "assign" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "assign" not in context.completed_steps or not context.resume
-            if should_run:
-                if not readable_path:
-                    readable_path = self._load_readable_path(context)
-                if not readable_path or not readable_path.exists():
-                    raise RuntimeError("Readable transcript is required for assignment. Run prettify first.")
-                # Perform name inference based on readable transcript and update artefacts
-                assigned_segments, derived_assignment_path = self._run_assignment_from_readable(
-                    context, adapter, readable_path
-                )
-                if assigned_segments is not None:
-                    transcript_segments = assigned_segments
-                assignment_path = derived_assignment_path or self._load_assignment_path(context)
-            else:
-                assignment_path = self._load_assignment_path(context)
-
-        # Validate artefacts for thematization
-        self._validate_condensed_availability(plan, condensed_path)
-        self._check_stop()
-
-        themes_path: Optional[Path] = None
-        if "thematize" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "thematize" not in context.completed_steps or not context.resume
-            if should_run:
-                if condensed_path is None:
-                    raise RuntimeError("Condensed transcript required for thematization.")
-                themes_path = self._run_thematize(context, adapter, condensed_path)
-            else:
-                themes_path = self._load_themes_path(context)
-                if not themes_path or not themes_path.exists():
-                    LOGGER.warning(
-                        "Themes artefact missing for %s; regenerating thematization output.",
-                        context.episode.episode_id,
-                    )
-                    if condensed_path is None:
-                        raise RuntimeError("Condensed transcript required for thematization.")
-                    themes_path = self._run_thematize(context, adapter, condensed_path)
-        elif "classify" in plan:
-            themes_path = self._load_themes_path(context)
-        self._check_stop()
-
-        # Validate themes artefact for classification
-        self._validate_themes_availability(plan, themes_path)
-        self._check_stop()
-
-        if "classify" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "classify" not in context.completed_steps or not context.resume
-            if should_run:
-                if themes_path is None:
-                    raise RuntimeError("Thematized transcript required for classification.")
-                self._run_classify(context, adapter, themes_path)
-            else:
-                classified_path = self._load_classified_path(context)
-                if not classified_path or not classified_path.exists():
-                    LOGGER.warning(
-                        "Classified artefact missing for %s; regenerating classification output.",
-                        context.episode.episode_id,
-                    )
-                    if themes_path is None:
-                        raise RuntimeError("Thematized transcript required for classification.")
-                    self._run_classify(context, adapter, themes_path)
-        self._check_stop()
-
-        # Validate classified artefact for vocative detection
-        self._validate_classified_availability(plan, context.completed_steps)
-        self._check_stop()
-
-        vocative_path: Optional[Path] = None
-        if "vocative" in plan:
-            # When resume=False, re-run even if step is completed
-            should_run = "vocative" not in context.completed_steps or not context.resume
-            if should_run:
-                classified_path = self._load_classified_path(context)
-                if classified_path is None:
-                    raise RuntimeError("Classified transcript required for vocative detection.")
-                vocative_path = self._run_vocative(context, adapter, classified_path)
-            else:
-                vocative_path = self._load_vocative_path(context)
-                if not vocative_path or not vocative_path.exists():
-                    LOGGER.warning(
-                        "Vocative artefact missing for %s; regenerating vocative detection output.",
-                        context.episode.episode_id,
-                    )
-                    classified_path = self._load_classified_path(context)
-                    if classified_path is None:
-                        raise RuntimeError("Classified transcript required for vocative detection.")
-                    vocative_path = self._run_vocative(context, adapter, classified_path)
-        elif "assign" in plan:
-            vocative_path = self._load_vocative_path(context)
-        self._check_stop()
-
-        # Validate vocative artefact for assignment (if needed)
-        self._validate_vocative_availability(plan, vocative_path)
-        self._check_stop()
-
-    def _run_transcription(  # pragma: no cover - complex integration path
+    def _extract_and_log_outputs(
         self,
         context: PipelineContext,
-        adapter: PipelineEventAdapter,
-    ) -> Sequence[TranscriptSegment]:
-        if not self.config.whisper_model:
-            raise RuntimeError("MYW_WHISPER_MODEL must be configured for transcription.")
-
-        config = TranscriptionConfig(
-            model_path=Path(self.config.whisper_model),
-            data_root=self.config.data_dir,
-            device=self.config.device,
+        step_name: str,
+        step: Any,
+        result_or_artefact: Any,
+        step_outputs: Dict[str, Any],
+        source: str,
+        elapsed: float,
+        executor: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract outputs from step result/artefact and log completion.
+        
+        Returns extracted outputs dict.
+        """
+        # Extract all outputs using standardized contract
+        extracted = extract_step_outputs(
+            step_name,
+            result_or_artefact,
+            step,
+            executor=executor,
         )
-        self._log_step_start(
-            context,
-            "transcribe",
-            {
-                "mode": "execute",
-                "config": _serialize_dataclass(config),
-                "resume": context.resume,
-            },
-        )
-        start_time = perf_counter()
-        transcriber = PodcastTranscriber.from_config(context.episode, config)
-        events = transcriber.transcribe(yield_progress=True)
-        segments = self._consume_events(context, adapter, "transcribe", events, context.step_plan)
-        elapsed = perf_counter() - start_time
+        
+        # Log completion
+        summary = step.get_summary(result_or_artefact, step_outputs)
         self._log_step_end(
             context,
-            "transcribe",
+            step_name,
             {
-                **self._transcript_summary(segments),
-                "source": "fresh",
+                **summary,
+                "source": source,
                 "elapsed": round(elapsed, 2),
             },
         )
-        return segments
+        
+        return extracted
 
-    def _load_transcript_segments(
-        self,
-        context: PipelineContext,
-    ) -> Optional[Sequence[TranscriptSegment]]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "transcribe")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("transcript_path") or checkpoint.payload.get("path")
-            LOGGER.info(f"Loading cached transcript from {path}")
-            if path:
-                transcript_path = Path(path)
-                try:
-                    return self._read_transcript(transcript_path)
-                except Exception:
-                    LOGGER.warning("Failed to load cached transcript at %s", transcript_path)
-        return None
-
-    def _run_diarization(  # pragma: no cover - complex integration path
-        self,
-        context: PipelineContext,
-        transcript_segments: Optional[Sequence[TranscriptSegment]],
-        adapter: PipelineEventAdapter,
-    ):
-        config = DiarizationConfig(
-            data_root=self.config.data_dir,
-            hf_token=self.config.hf_token,
-            device=self.config.device,
-        )
-        self._log_step_start(
-            context,
-            "diarize",
-            {
-                "mode": "execute",
-                "config": _serialize_dataclass(config),
-                "transcript_available": bool(transcript_segments),
-            },
-        )
-        start_time = perf_counter()
-        pipeline = DiarizationPipeline.from_config(context.episode, config)
-        paths = config.artefact_paths(context.episode, context.episode.episode_key)
-
-        start_event = PipelineEvent(
-            stage="start",
-            step_name="diarize",
-            episode_id=context.episode.episode_id,
-            message=f"Starting diarization for {context.episode.episode_title}",
-            payload={
-                "episode_key": context.episode.episode_key,
-                "step": "started",
-            },
-            artefact_paths={"rttm": paths["rttm_path"]},
-            checkpoint={
-                "status": "started",
-                "step": "diarize",
-                "episode_key": context.episode.episode_key,
-            },
-        )
-        self._handle_event(context, adapter, "diarize", start_event, context.step_plan)
-
-        turns = pipeline.run()
-        elapsed = perf_counter() - start_time
-
-        completed_event = PipelineEvent(
-            stage="persisted",
-            step_name="diarize",
-            episode_id=context.episode.episode_id,
-            message="Persisted diarization RTTM",
-            payload={
-                "path": str(paths["rttm_path"]),
-                "turns": len(turns),
-                "step": "completed",
-            },
-            artefact_paths={"rttm": paths["rttm_path"]},
-            checkpoint={
-                "status": "completed",
-                "step": "diarize",
-                "rttm_path": str(paths["rttm_path"]),
-                "turns": len(turns),
-            },
-        )
-        self._handle_event(context, adapter, "diarize", completed_event, context.step_plan)
-        self._log_step_end(
-            context,
-            "diarize",
-            {
-                **self._diarization_summary(turns, artefact_path=str(paths["rttm_path"])),
-                "source": "fresh",
-                "elapsed": round(elapsed, 2),
-            },
-        )
-        return turns
-
-    def _load_diarization_results(self, context: PipelineContext):
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "diarize")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("rttm_path")
-            if path:
-                return Path(path)
-        return None
-
-    def _load_assignment_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "assign")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("assignment_path") or checkpoint.payload.get("path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        return None
-
-    def _load_readable_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "prettify")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("readable_path") or checkpoint.payload.get("path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        return None
-
-    def _load_condensed_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "prettify")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("condensed_path") or checkpoint.payload.get("condensed_path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        # Fallback to any condensed path captured from recent events
-        fallback = getattr(self, "_last_condensed_path", None)
-        if isinstance(fallback, Path) and fallback.exists():
-            return fallback
-        return None
-
-    def _load_themes_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "thematize")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("themes_path") or checkpoint.payload.get("path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        return None
-
-    def _run_assignment(  # pragma: no cover - complex integration path
-        self,
-        context: PipelineContext,
-        segments: Sequence[TranscriptSegment],
-        adapter: PipelineEventAdapter,
-    ) -> tuple[Sequence[TranscriptSegment], Optional[Path]]:
-        config = AssignmentConfig(
-            data_root=self.config.data_dir,
-            ollama_model=self.config.ollama_model,
-            spacy_model=self.config.spacy_model,
-        )
-        self._log_step_start(
-            context,
-            "assign",
-            {
-                "mode": "execute",
-                "config": _serialize_dataclass(config),
-                "segment_count": len(segments),
-            },
-        )
-        start_time = perf_counter()
-        assigner = TranscriptAssigner.from_config(context.episode, config)
-        events = assigner.assign_names(segments, metadata=context.episode.metadata, yield_progress=True)
-        assignment = self._consume_events(context, adapter, "assign", events, context.step_plan)
-        elapsed = perf_counter() - start_time
-        self._log_step_end(
-            context,
-            "assign",
-            {
-                **self._assignment_summary(assignment),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
-            },
-        )
-        assignment_path = getattr(assigner, "_last_assignment_path", None)
-        if assignment_path:
-            assignment_path = Path(assignment_path)
-        return assignment, assignment_path
-
-    def _run_assignment_from_readable(  # pragma: no cover - complex integration path
+    def _execute_step(
         self,
         context: PipelineContext,
         adapter: PipelineEventAdapter,
-        readable_path: Path,
-    ) -> tuple[Sequence[TranscriptSegment], Optional[Path]]:
-        config = AssignmentConfig(
-            data_root=self.config.data_dir,
-            ollama_model=self.config.ollama_model,
-            spacy_model=self.config.spacy_model,
-        )
-        self._log_step_start(
-            context,
-            "assign",
-            {
-                "mode": "execute",
-                "config": _serialize_dataclass(config),
-                "readable_path": str(readable_path),
-            },
-        )
+        step_name: str,
+        step: Any,
+        inputs: Dict[str, Any],
+        plan: Sequence[str],
+        step_outputs: Dict[str, Any],
+        mode: str = "execute",
+        extra_log_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a step and return extracted outputs.
+        
+        Returns extracted outputs dict.
+        """
+        # Log step start
+        log_data = {"mode": mode, "resume": context.resume}
+        if extra_log_data:
+            log_data.update(extra_log_data)
+        self._log_step_start(context, step_name, log_data)
+        
         start_time = perf_counter()
-        assigner = TranscriptAssigner.from_config(context.episode, config)
-        events = assigner.assign_from_readable(readable_path, metadata=context.episode.metadata, yield_progress=True)
-        assignment = self._consume_events(context, adapter, "assign", events, context.step_plan)
+        
+        # Create executor
+        executor = step.create_executor(context.episode, catalog=self.catalog)
+        
+        # Execute the step with prepared inputs
+        events = step.execute(executor, **inputs)
+        
+        # Consume events and get result
+        result = self._consume_events(context, adapter, step_name, events, plan)
         elapsed = perf_counter() - start_time
-        self._log_step_end(
+        
+        # Extract outputs and log completion
+        extracted = self._extract_and_log_outputs(
             context,
-            "assign",
-            {
-                **self._assignment_summary(assignment),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
-            },
+            step_name,
+            step,
+            result,
+            step_outputs,
+            source="fresh",
+            elapsed=elapsed,
+            executor=executor,
         )
-        assignment_path = getattr(assigner, "_last_assignment_path", None)
-        if assignment_path:
-            assignment_path = Path(assignment_path)
-        return assignment, assignment_path
+        
+        return extracted
 
-    def _run_prettify(  # pragma: no cover - complex integration path
+    def _load_step_from_checkpoint(
         self,
         context: PipelineContext,
-        adapter: PipelineEventAdapter,
-        assignment_path: Path,
-    ) -> Path:
-        config = PrettifyConfig(data_root=self.config.data_dir)
+        step_name: str,
+        step: Any,
+    ) -> tuple[Any, Dict[str, Any]]:
+        """
+        Load step artefact from checkpoint and return (artefact, extracted_outputs).
+        
+        Returns tuple of (artefact, extracted_outputs). If artefact is None,
+        extracted_outputs will be empty dict.
+        """
+        # Log checkpoint load start
         self._log_step_start(
             context,
-            "prettify",
+            step_name,
             {
-                "mode": "execute",
-                "assignment_path": str(assignment_path),
+                "mode": "load_checkpoint",
+                "checkpoint_status": context.completed_steps.get(step_name, "unknown"),
             },
         )
-        start_time = perf_counter()
-        prettifier = TranscriptPrettifier(
-            podcast=context.episode,
-            config=config,
-            catalog=self.catalog,
+        
+        load_start = perf_counter()
+        artefact = step.load_artefact(self.checkpoints, context.episode.episode_id)
+        load_elapsed = perf_counter() - load_start
+        
+        if artefact is None:
+            return None, {}
+        
+        # Extract outputs from loaded artefact
+        extracted = extract_step_outputs(
+            step_name,
+            artefact,
+            step,
         )
-        events = prettifier.prettify(assignment_path=assignment_path, yield_progress=True)
-        readable_path = self._consume_events(context, adapter, "prettify", events, context.step_plan)
-        elapsed = perf_counter() - start_time
+        
+        # Log completion
+        summary = step.get_summary(artefact, {})
         self._log_step_end(
             context,
-            "prettify",
+            step_name,
             {
-                "path": str(readable_path),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
+                **summary,
+                "source": "checkpoint",
+                "elapsed": round(load_elapsed, 2),
             },
         )
-        return readable_path
-
-    def _run_thematize(  # pragma: no cover - complex integration path
-        self,
-        context: PipelineContext,
-        adapter: PipelineEventAdapter,
-        condensed_path: Path,
-    ) -> Path:
-        config = ThematizeConfig(
-            data_root=self.config.data_dir,
-            llm_model=self.config.ollama_model,
-        )
-        self._log_step_start(
-            context,
-            "thematize",
-            {
-                "mode": "execute",
-                "condensed_path": str(condensed_path),
-            },
-        )
-        start_time = perf_counter()
-        thematizer = EpisodeThematizer(
-            podcast=context.episode,
-            config=config,
-            catalog=self.catalog,
-        )
-        events = thematizer.thematize(condensed_path=condensed_path, yield_progress=True)
-        themes_path = self._consume_events(context, adapter, "thematize", events, context.step_plan)
-        elapsed = perf_counter() - start_time
-        self._log_step_end(
-            context,
-            "thematize",
-            {
-                "path": str(themes_path),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
-            },
-        )
-        return themes_path
-
-    def _run_classify(  # pragma: no cover - complex integration path
-        self,
-        context: PipelineContext,
-        adapter: PipelineEventAdapter,
-        themes_path: Path,
-    ) -> Path:
-        config = ClassifyConfig(data_root=self.config.data_dir)
-        self._log_step_start(
-            context,
-            "classify",
-            {
-                "mode": "execute",
-                "themes_path": str(themes_path),
-            },
-        )
-        start_time = perf_counter()
-        classifier = EpisodeClassifier(
-            podcast=context.episode,
-            config=config,
-            catalog=self.catalog,
-        )
-        events = classifier.classify(themes_path=themes_path, yield_progress=True)
-        classified_path = self._consume_events(context, adapter, "classify", events, context.step_plan)
-        elapsed = perf_counter() - start_time
-        self._log_step_end(
-            context,
-            "classify",
-            {
-                "path": str(classified_path),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
-            },
-        )
-        return classified_path
-
-    def _load_classified_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "classify")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("classified_path") or checkpoint.payload.get("path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        return None
-
-    def _run_vocative(  # pragma: no cover - complex integration path
-        self,
-        context: PipelineContext,
-        adapter: PipelineEventAdapter,
-        classified_path: Path,
-    ) -> Path:
-        config = VocativeConfig(
-            data_root=self.config.data_dir,
-            spacy_model=self.config.spacy_model,
-            llm_model=self.config.ollama_model,
-        )
-        self._log_step_start(
-            context,
-            "vocative",
-            {
-                "mode": "execute",
-                "classified_path": str(classified_path),
-            },
-        )
-        start_time = perf_counter()
-        detector = EpisodeVocativeDetector(
-            podcast=context.episode,
-            config=config,
-            catalog=self.catalog,
-        )
-        events = detector.detect_vocatives(classified_path=classified_path, yield_progress=True)
-        vocative_path = self._consume_events(context, adapter, "vocative", events, context.step_plan)
-        elapsed = perf_counter() - start_time
-        self._log_step_end(
-            context,
-            "vocative",
-            {
-                "path": str(vocative_path),
-                "elapsed": round(elapsed, 2),
-                "source": "fresh",
-            },
-        )
-        return vocative_path
-
-    def _load_vocative_path(self, context: PipelineContext) -> Optional[Path]:
-        checkpoint = self.checkpoints.get_step(context.episode.episode_id, "vocative")
-        if checkpoint and checkpoint.status == "completed":
-            path = checkpoint.details.get("vocative_path") or checkpoint.payload.get("path")
-            if path:
-                resolved = Path(path)
-                if resolved.exists():
-                    return resolved
-        return None
+        
+        return artefact, extracted
 
     def _consume_events(
         self,
@@ -886,22 +514,6 @@ class PipelineRunner:
         event: PipelineEvent,
         step_plan: Sequence[str],
     ) -> None:
-        # Capture condensed path from prettify events even if checkpoints are not persisted (useful in tests)
-        if step == "prettify":
-            try:
-                condensed_val = event.checkpoint.get("condensed_path")
-            except Exception:
-                condensed_val = None
-            if not condensed_val:
-                try:
-                    condensed_val = (event.artefact_paths or {}).get("condensed")
-                except Exception:
-                    condensed_val = None
-            if condensed_val:
-                try:
-                    self._last_condensed_path = Path(condensed_val)
-                except Exception:
-                    self._last_condensed_path = None
         if event.transient:
             self._check_stop()
             return
@@ -965,52 +577,57 @@ class PipelineRunner:
             _stringify_data(outputs),
         )
 
-    def _transcript_summary(
-        self,
-        segments: Optional[Sequence[TranscriptSegment]],
-    ) -> Dict[str, Any]:
-        if not segments:
-            return {"segments": 0, "duration_sec": 0.0, "speaker_ids": 0}
-        starts = [seg.start for seg in segments]
-        ends = [seg.end for seg in segments]
-        duration = max(ends, default=0.0) - min(starts, default=0.0)
-        unique_speakers = len({seg.speaker_id for seg in segments if seg.speaker_id})
-        return {
-            "segments": len(segments),
-            "duration_sec": round(duration, 2),
-            "speaker_ids": unique_speakers,
-        }
+    def _get_validation_kwargs(self, step_name: str, step_outputs: Dict[str, Any], context: PipelineContext) -> Dict[str, Any]:
+        """
+        Get validation keyword arguments for a step by delegating to the step itself.
+        
+        This method follows the abstraction principle - each step knows what validation
+        kwargs it needs from its outputs.
+        
+        For steps that need dependencies for validation (like classify needing themes_path),
+        we also load those dependencies from checkpoints.
+        """
+        # Handle special case: "condensed" is not a real step
+        if step_name == "condensed":
+            return {"condensed_path": step_outputs.get("condensed_path")}
+        
+        # Get step instance and delegate to its get_validation_kwargs method
+        try:
+            step = get_step(step_name, self.config)
+            return step.get_validation_kwargs(
+                step_outputs,
+                checkpoints=self.checkpoints,
+                episode_id=context.episode.episode_id,
+            )
+        except ValueError:
+            # Step not found - return empty kwargs
+            return {}
 
-    def _diarization_summary(
+    def _validate_downstream_artefacts(
         self,
-        diarization_results,
-        artefact_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        if diarization_results is None:
-            return {"turns": 0, "artefact_path": artefact_path}
-        if isinstance(diarization_results, (str, Path)):
-            return {"turns": None, "artefact_path": str(diarization_results)}
-        turns_count = len(diarization_results) if hasattr(diarization_results, "__len__") else None
-        return {
-            "turns": turns_count,
-            "artefact_path": artefact_path,
-        }
-
-    def _assignment_summary(
-        self,
-        segments: Optional[Sequence[TranscriptSegment]],
-    ) -> Dict[str, Any]:
-        if not segments:
-            return {"segments": 0, "named_segments": 0, "unknown_segments": 0}
-        named_segments = sum(
-            1 for seg in segments if seg.speaker_name and seg.speaker_name.strip().upper() != "UNKNOWN"
-        )
-        unknown_segments = len(segments) - named_segments
-        return {
-            "segments": len(segments),
-            "named_segments": named_segments,
-            "unknown_segments": unknown_segments,
-        }
+        step_name: str,
+        step_outputs: Dict[str, Any],
+        plan: Sequence[str],
+        context: PipelineContext,
+    ) -> None:
+        """
+        Validate artefacts produced by this step that are needed by downstream steps.
+        
+        This method checks if any outputs from the current step are needed by downstream
+        steps in the plan, and validates those outputs accordingly. This handles cases
+        like prettify producing condensed_path which is needed by thematize.
+        """
+        # Check downstream steps in the plan
+        current_index = STEP_ORDER.index(step_name) if step_name in STEP_ORDER else -1
+        downstream_steps = [
+            s for s in STEP_ORDER
+            if s in plan and STEP_ORDER.index(s) > current_index
+        ]
+        
+        # Check if prettify produced condensed_path and thematize needs it
+        if step_name == "prettify" and "thematize" in downstream_steps:
+            condensed_path = step_outputs.get("condensed_path")
+            validate_step_availability("condensed", plan, myw_config=self.config, condensed_path=condensed_path)
 
     def _completed_steps(
         self,
@@ -1048,93 +665,7 @@ class PipelineRunner:
             return STEP_ORDER
         return tuple(normalized)
 
-    def _plan_requires_transcript(self, plan: Sequence[str]) -> bool:
-        return "transcribe" not in plan and any(step in ("diarize",) for step in plan)
-
-    def _validate_transcript_availability(
-        self,
-        plan: Sequence[str],
-        segments: Optional[Sequence[TranscriptSegment]],
-    ) -> None:
-        if self._plan_requires_transcript(plan) and segments is None:
-            raise RuntimeError(
-                "Transcript segments are required for the selected steps. Run transcription first or include it in the plan."
-            )
-
-    def _validate_diarization_availability(
-        self,
-        plan: Sequence[str],
-        completed_steps: Dict[str, str],
-        diarization_results,
-    ) -> None:
-        if not any(step in plan for step in ("prettify", "assign")):
-            return
-        # Allow if diarization will run in this plan or is already completed
-        if "diarize" in plan or "diarize" in completed_steps:
-            return
-        if diarization_results is None:
-            raise RuntimeError(
-                "Diarization results are required for prettify/assign. Include diarization before these steps."
-            )
-
-    def _validate_assignment_availability(
-        self,
-        plan: Sequence[str],
-        readable_path: Optional[Path],
-    ) -> None:
-        if "assign" not in plan:
-            return
-        if readable_path is None or not readable_path.exists():
-            raise RuntimeError(
-                "Readable transcript artefact is required. Run prettify before assignment or include it in the plan."
-            )
-
-    def _validate_condensed_availability(
-        self,
-        plan: Sequence[str],
-        condensed_path: Optional[Path],
-    ) -> None:
-        if "thematize" not in plan:
-            return
-        if condensed_path is None or not condensed_path.exists():
-            raise RuntimeError(
-                "Condensed transcript artefact is required for thematization. Run prettify first or include it in the plan."
-            )
-
-    def _validate_themes_availability(
-        self,
-        plan: Sequence[str],
-        themes_path: Optional[Path],
-    ) -> None:
-        if "classify" not in plan:
-            return
-        if themes_path is None or not themes_path.exists():
-            raise RuntimeError(
-                "Thematized transcript artefact is required for classification. Run thematize first or include it in the plan."
-            )
-
-    def _validate_classified_availability(
-        self,
-        plan: Sequence[str],
-        completed_steps: Dict[str, str],
-    ) -> None:
-        if "vocative" not in plan:
-            return
-        # Allow if classify will run in this plan or is already completed
-        if "classify" in plan or "classify" in completed_steps:
-            return
-        # Check if classified path exists from checkpoint
-        # This is a soft check - actual validation happens in _run_vocative
-        pass
-
-    def _validate_vocative_availability(
-        self,
-        plan: Sequence[str],
-        vocative_path: Optional[Path],
-    ) -> None:
-        # Vocative is optional for assign step, so we don't require it
-        # This validation can be used in the future if needed
-        pass
+    # Validation is now handled generically via validate_step_availability
 
     def _completion_message(self, plan: Sequence[str]) -> str:
         normalized = list(plan) or list(STEP_ORDER)
@@ -1213,7 +744,7 @@ class PipelineRunner:
                     pipeline_id=status_row["pipeline_id"],
                     status="completed",
                     current_step="Completed",
-                    last_completed_step="assign",
+                    last_completed_step=STEP_ORDER[-1] if STEP_ORDER else None,
                     progress=1.0,
                     remarks=remarks,
                 )
@@ -1224,169 +755,4 @@ class PipelineRunner:
         status = PipelineStatus(active=False, episode_id=episode_id, step="Completed", message=remarks, progress=1.0)
         payload = PipelineEventPayload(episode_id=episode_id, status=status, remarks=remarks)
         self.callback(PipelineCompleted(payload))
-
-    def _read_transcript(self, path: Path) -> Optional[Sequence[TranscriptSegment]]:
-        if not path.exists():
-            return None
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        segments: list[TranscriptSegment] = []
-        for item in data:
-            segments.append(
-                TranscriptSegment(
-                    start=float(item["start"]),
-                    end=float(item["end"]),
-                    text=str(item.get("text", "")),
-                    speaker_id=item.get("speaker_id") or item.get("speaker"),
-                    speaker_name=item.get("speaker_name"),
-                    confidence=item.get("confidence"),
-                    justification=item.get("justification"),
-                    metadata=item.get("metadata", {}),
-                )
-            )
-        return segments
-
-    def _ensure_diarized_turns(self, diarization_results) -> List[DiarizedTurn]:
-        if diarization_results is None:
-            return []
-
-        if isinstance(diarization_results, list):
-            turns: List[DiarizedTurn] = []
-            for item in diarization_results:
-                if isinstance(item, DiarizedTurn):
-                    turns.append(item)
-                elif isinstance(item, dict):
-                    try:
-                        start = float(item["start"])
-                        end = float(item["end"])
-                        speaker = str(item.get("speaker") or item.get("speaker_id") or "")
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    turns.append(DiarizedTurn(start=start, end=end, speaker_id=speaker or "UNKNOWN"))
-            turns.sort(key=lambda turn: (turn.start, turn.end))
-            return turns
-
-        if isinstance(diarization_results, (str, Path)):
-            return self._read_rttm_turns(Path(diarization_results))
-
-        return []
-
-    def _read_rttm_turns(self, path: Path) -> List[DiarizedTurn]:
-        if not path.exists():
-            LOGGER.warning("RTTM file %s not found; cannot load diarization turns.", path)
-            return []
-
-        turns: List[DiarizedTurn] = []
-        with path.open("r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) < 8 or parts[0].upper() != "SPEAKER":
-                    continue
-                try:
-                    start = float(parts[3])
-                    duration = float(parts[4])
-                except ValueError:
-                    continue
-                speaker = parts[7] if len(parts) > 7 else ""
-                turns.append(
-                    DiarizedTurn(
-                        start=start,
-                        end=start + duration,
-                        speaker_id=str(speaker or f"speaker_{len(turns)}"),
-                    )
-                )
-        turns.sort(key=lambda turn: (turn.start, turn.end))
-        return turns
-
-    def _apply_diarization_labels(
-        self,
-        segments: Sequence[TranscriptSegment],
-        turns: Sequence[DiarizedTurn],
-    ) -> List[TranscriptSegment]:
-        if not segments:
-            return []
-        if not turns:
-            return list(segments)
-
-        sorted_turns = sorted(turns, key=lambda turn: (turn.start, turn.end))
-        updated_segments: List[TranscriptSegment] = []
-        leading_index = 0
-        total_turns = len(sorted_turns)
-
-        for seg in segments:
-            if seg.speaker_id:
-                updated_segments.append(seg)
-                continue
-
-            start = seg.start
-            end = seg.end
-            best_id: Optional[str] = None
-            best_overlap = 0.0
-
-            idx = leading_index
-            while idx < total_turns and sorted_turns[idx].end <= start:
-                idx += 1
-            leading_index = idx
-
-            scan = idx
-            while scan < total_turns:
-                turn = sorted_turns[scan]
-                if turn.start >= end:
-                    break
-                overlap_start = max(start, turn.start)
-                overlap_end = min(end, turn.end)
-                if overlap_end > overlap_start:
-                    overlap = overlap_end - overlap_start
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_id = turn.speaker_id
-                scan += 1
-
-            if best_id:
-                updated_segments.append(
-                    TranscriptSegment(
-                        start=seg.start,
-                        end=seg.end,
-                        text=seg.text,
-                        speaker_id=best_id,
-                        speaker_name=seg.speaker_name,
-                        confidence=seg.confidence,
-                        justification=seg.justification,
-                        metadata=dict(seg.metadata),
-                    )
-                )
-            else:
-                updated_segments.append(seg)
-
-        return updated_segments
-
-    def _ensure_placeholder_assignment(
-        self,
-        context: PipelineContext,
-        segments: Sequence[TranscriptSegment],
-    ) -> Path:
-        """
-        Persist a placeholder 'assigned transcript' JSON that contains diarized segments
-        with speaker_id placeholders and speaker_name mirroring the speaker_id. This allows
-        the existing prettifier to operate deterministically before real name assignment.
-        """
-        cfg = PrettifyConfig(data_root=self.config.data_dir)
-        assignment_path = cfg.assignment_path(context.episode, context.episode.episode_key).resolve()
-        assignment_path.parent.mkdir(parents=True, exist_ok=True)
-        records: list[dict] = []
-        for seg in segments:
-            records.append(
-                {
-                    "start": float(seg.start),
-                    "end": float(seg.end),
-                    "text": seg.text,
-                    "speaker_id": seg.speaker_id or "UNKNOWN",
-                    "speaker_name": seg.speaker_id or "UNKNOWN",
-                }
-            )
-        assignment_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        return assignment_path
 

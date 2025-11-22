@@ -41,7 +41,8 @@ def test_prettifier_collapses_segments_and_records_artefact(tmp_path):
     catalog = StubCatalog()
     prettifier = TranscriptPrettifier(episode, config=config, catalog=catalog)
 
-    readable_path = prettifier.prettify()
+    result = prettifier.prettify()
+    readable_path = result.get("readable_path") if isinstance(result, dict) else result
     assert readable_path.exists()
     lines = readable_path.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "Host (S0): Hello there"
@@ -70,12 +71,13 @@ def test_prettifier_generator_emits_events(tmp_path):
         while True:
             events.append(next(generator))
     except StopIteration as stop:
-        readable_path = stop.value
+        result = stop.value
 
     assert events
     assert all(event.stage == "prettify" for event in events)
     assert events[0].checkpoint["status"] == "started"
     assert events[-1].checkpoint["status"] == "completed"
+    readable_path = result.get("readable_path") if isinstance(result, dict) else result
     assert readable_path.exists()
 
 

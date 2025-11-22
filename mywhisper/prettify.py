@@ -5,9 +5,10 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generator, Iterable, List, Optional, Sequence
+from typing import Dict, Generator, Iterable, List, Optional, Sequence
 
 from .config import ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode, TranscriptSegment
 from .podcasts import PodcastCatalog
 
@@ -41,7 +42,7 @@ class PrettifyConfig:
         return directory / f"{key}_readable.txt"
 
 
-class TranscriptPrettifier:
+class TranscriptPrettifier(LoggingBase):
     """
     Collapse diarized segments into readable blocks and persist text artefacts.
     """
@@ -60,13 +61,26 @@ class TranscriptPrettifier:
         self.logger = base_logger.getChild(podcast.episode_id)
         self._last_assignment_path: Optional[Path] = None
         self._last_readable_path: Optional[Path] = None
+        self._last_condensed_path: Optional[Path] = None
+
+    def get_outputs(self) -> Dict[str, Optional[Path]]:
+        """
+        Get all outputs from prettify execution.
+        
+        Returns:
+            Dictionary with readable_path and condensed_path keys.
+        """
+        return {
+            "readable_path": self._last_readable_path,
+            "condensed_path": self._last_condensed_path,
+        }
 
     def prettify(
         self,
         *,
         assignment_path: Optional[Path] = None,
         yield_progress: bool = False,
-    ) -> Path | Generator[PipelineEvent, None, Path]:
+    ) -> Dict[str, Path] | Generator[PipelineEvent, None, Dict[str, Path]]:
         pipeline = self._pipeline(assignment_path=assignment_path)
         if yield_progress:
             return pipeline
@@ -84,7 +98,7 @@ class TranscriptPrettifier:
     def _pipeline(
         self,
         assignment_path: Optional[Path],
-    ) -> Generator[PipelineEvent, None, Path]:
+    ) -> Generator[PipelineEvent, None, Dict[str, Path]]:
         episode_key = self.podcast.episode_key
         resolved_assignment = assignment_path or self.config.assignment_path(self.podcast, episode_key)
         resolved_assignment = resolved_assignment.resolve()
@@ -215,7 +229,7 @@ class TranscriptPrettifier:
         self._last_assignment_path = resolved_assignment
         self._last_readable_path = readable_path
         self._last_condensed_path = condensed_path
-        return readable_path
+        return {"readable_path": readable_path, "condensed_path": condensed_path}
 
     def _load_segments(self, path: Path) -> List[TranscriptSegment]:
         records = json.loads(path.read_text(encoding="utf-8"))

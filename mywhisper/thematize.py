@@ -10,6 +10,7 @@ from typing import Generator, Iterable, List, Optional, Sequence
 
 from .assign import LLMClient, OllamaClient
 from .config import ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode
 from .podcasts import PodcastCatalog
 
@@ -54,7 +55,7 @@ class ThematizeConfig:
         return directory / f"{key}_with_themes.json"
 
 
-class EpisodeThematizer:
+class EpisodeThematizer(LoggingBase):
     """
     Convert readable transcripts into structured theme sections via LLM prompts.
     """

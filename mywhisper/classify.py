@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Generator, List, Optional, Sequence
 
 from .config import ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode
 from .podcasts import PodcastCatalog
 
@@ -48,7 +49,7 @@ class ClassifyConfig:
         return directory / f"{key}_classified.json"
 
 
-class EpisodeClassifier:
+class EpisodeClassifier(LoggingBase):
     """
     Classify podcast segments to identify non-editorial content using zero-shot classification.
     """

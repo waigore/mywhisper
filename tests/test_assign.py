@@ -137,7 +137,8 @@ def test_transcript_assigner_persists_results(tmp_path, monkeypatch):
     monkeypatch.setattr(CandidateRoster, "compile", lambda self, *_args, **_kwargs: ["Alice", "Bob"])
 
     results = assigner.assign_names(segments)
-    assert [seg.speaker_name for seg in results] == ["Alice", "Bob"]
+    transcript_segments = results.get("transcript_segments") if isinstance(results, dict) else results
+    assert [seg.speaker_name for seg in transcript_segments] == ["Alice", "Bob"]
 
     assignment_path = assigner._last_assignment_path  # type: ignore[attr-defined]
     assert assignment_path.exists()
@@ -316,7 +317,8 @@ def test_tie_break_assigns_unique_names(tmp_path, monkeypatch):
     monkeypatch.setattr(CandidateRoster, "compile", lambda self, *_args, **_kwargs: ["Anthony Pompliano", "Host", "Guest"])
 
     results = assigner.assign_names(segments)
-    names = {seg.speaker_id: seg.speaker_name for seg in results if seg.speaker_id}
+    transcript_segments = results.get("transcript_segments") if isinstance(results, dict) else results
+    names = {seg.speaker_id: seg.speaker_name for seg in transcript_segments if seg.speaker_id}
     assert names["SPEAKER_00"] == "Host"
     assert names["SPEAKER_01"] == "Guest"
 
@@ -358,11 +360,12 @@ def test_random_resolution_when_tie_persists(tmp_path, monkeypatch):
     monkeypatch.setattr(CandidateRoster, "compile", lambda self, *_args, **_kwargs: ["Anthony Pompliano"])
 
     results = assigner.assign_names(segments)
+    transcript_segments = results.get("transcript_segments") if isinstance(results, dict) else results
     speaker_names = {
-        seg.speaker_id: seg.speaker_name
-        for seg in results
-        if seg.speaker_id in {"SPEAKER_00", "SPEAKER_01"}
-    }
+            seg.speaker_id: seg.speaker_name
+            for seg in transcript_segments
+            if seg.speaker_id in {"SPEAKER_00", "SPEAKER_01"}
+        }
     assert len(set(speaker_names.values())) == 2
 
 
@@ -400,7 +403,8 @@ def test_assign_from_readable_updates_labels(tmp_path, monkeypatch):
         enriched = stop.value
 
     # Check enriched segments carry names
-    names = {seg.speaker_id: seg.speaker_name for seg in enriched}
+    transcript_segments = enriched.get("transcript_segments") if isinstance(enriched, dict) else enriched
+    names = {seg.speaker_id: seg.speaker_name for seg in transcript_segments}
     assert names["SPEAKER_00"] == "Alice"
     assert names["SPEAKER_01"] == "Bob"
 

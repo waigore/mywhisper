@@ -17,6 +17,7 @@ from .config import (
     ensure_data_subdir,
     generate_artefact_key,
 )
+from .logging_utils import LoggingBase, LoggingMeta, SerializationMode, log_function, serialize_input, serialize_output
 from .models import (
     PipelineEvent,
     PodcastEpisode,
@@ -39,6 +40,12 @@ __all__ = [
     "TranscriptSegment",
     "SpeakerAssignment",
     "SpeakerProfile",
+    "LoggingBase",
+    "LoggingMeta",
+    "log_function",
+    "SerializationMode",
+    "serialize_input",
+    "serialize_output",
 ]
 
 ROOT_LOGGER_NAME = "mywhisper"

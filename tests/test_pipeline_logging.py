@@ -14,6 +14,13 @@ from mywhisper.myw.services.pipeline import (
     _serialize_dataclass,
     _stringify_data,
 )
+from mywhisper.myw.services.steps import (
+    apply_diarization_labels,
+    read_transcript,
+    TranscribeStep,
+    DiarizeStep,
+    AssignStep,
+)
 
 
 class DummyQueue:
@@ -75,9 +82,17 @@ def build_runner(tmp_path: Path, *, queue: DummyQueue | None = None, checkpoints
         spacy_model="en_core_web_sm",
         hf_token=None,
     )
+    # A minimal catalog stub to satisfy type expectations when needed
+    class StubCatalog:
+        def get_episode(self, episode_id: str):
+            return None
+        
+        def record_artefact(self, episode_id: str, kind: str, path: Path, artefact_key: str):
+            pass
+    
     return PipelineRunner(
         config=config,
-        catalog=object(),
+        catalog=StubCatalog(),
         queue=queue or DummyQueue(),
         checkpoints=checkpoints or DummyCheckpoints(),
         callback=None,
@@ -132,23 +147,23 @@ def test_summary_helpers_and_logging(tmp_path, caplog):
             speaker_name="UNKNOWN",
         ),
     ]
-    transcript_summary = runner._transcript_summary(segments)
+    transcribe_step = TranscribeStep(runner.config)
+    transcript_summary = transcribe_step.get_summary(segments, {})
     assert transcript_summary["segments"] == 2
     assert transcript_summary["speaker_ids"] == 2
     assert transcript_summary["duration_sec"] == 3.5
 
-    diarization_summary = runner._diarization_summary(
-        [{"speaker": "S0"}],
-        artefact_path="/tmp/turns.rttm",
-    )
+    diarize_step = DiarizeStep(runner.config)
+    diarization_summary = diarize_step.get_summary([{"speaker": "S0"}], {})
     assert diarization_summary["turns"] == 1
-    assert diarization_summary["artefact_path"] == "/tmp/turns.rttm"
+    assert diarization_summary["artefact_path"] is None
 
-    file_summary = runner._diarization_summary("/tmp/turns.rttm")
+    file_summary = diarize_step.get_summary("/tmp/turns.rttm", {})
     assert file_summary["turns"] is None
     assert file_summary["artefact_path"] == "/tmp/turns.rttm"
 
-    assignment_summary = runner._assignment_summary(segments)
+    assign_step = AssignStep(runner.config)
+    assignment_summary = assign_step.get_summary(None, {"transcript_segments": segments})
     assert assignment_summary["segments"] == 2
     assert assignment_summary["named_segments"] == 1
     assert assignment_summary["unknown_segments"] == 1
@@ -220,51 +235,67 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
     themes_path.write_text("[]")
 
     class StubAssigner:
-        def __init__(self):
-            self._last_assignment_path = assignment_path
+            def __init__(self):
+                self._last_assignment_path = assignment_path
 
-        def assign_names(self, segments, metadata=None, yield_progress=True):
-            def generator():
-                yield PipelineEvent(
-                    stage="progress",
-                    step_name="assign",
-                    episode_id=episode.episode_id,
-                    message="started",
-                    payload={"step": "completed"},
-                    checkpoint={
-                        "status": "completed",
-                        "assignment_path": str(assignment_path),
-                    },
-                )
-                return assigned_segments
+            def assign_names(self, segments, metadata=None, yield_progress=True):
+                def generator():
+                    yield PipelineEvent(
+                        stage="progress",
+                        step_name="assign",
+                        episode_id=episode.episode_id,
+                        message="started",
+                        payload={"step": "completed"},
+                        checkpoint={
+                            "status": "completed",
+                            "assignment_path": str(assignment_path),
+                        },
+                    )
+                    return {"transcript_segments": assigned_segments, "assignment_path": assignment_path}
 
-            return generator()
-        def assign_from_readable(self, readable_path: Path, metadata=None, yield_progress: bool = True):
-            # Mirror assign_names behavior for this stub, ignoring readable input
-            return self.assign_names([], metadata=metadata, yield_progress=yield_progress)
+                return generator()
+            def assign_from_readable(self, readable_path: Path, metadata=None, yield_progress: bool = True):
+                # Mirror assign_names behavior for this stub, ignoring readable input
+                return self.assign_names([], metadata=metadata, yield_progress=yield_progress)
+            
+            def get_assignment_path(self):
+                return self._last_assignment_path
+            
+            def get_outputs(self):
+                return {
+                    "transcript_segments": None,
+                    "assignment_path": self._last_assignment_path,
+                }
 
     class StubPrettifier:
-        def __init__(self, *args, **kwargs):
-            pass
+            def __init__(self, *args, **kwargs):
+                self._last_readable_path = readable_path
+                self._last_condensed_path = condensed_path
 
-        def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
-            def generator():
-                yield PipelineEvent(
-                    stage="prettify",
-                    step_name="prettify",
-                    episode_id=episode.episode_id,
-                    message="prettifying",
-                    payload={"step": "completed"},
-                    checkpoint={
-                        "status": "completed",
-                        "readable_path": str(readable_path),
-                        "condensed_path": str(condensed_path),
-                    },
-                    artefact_paths={"readable": readable_path, "condensed": condensed_path},
-                )
-                return readable_path
+            def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
+                def generator():
+                    yield PipelineEvent(
+                        stage="prettify",
+                        step_name="prettify",
+                        episode_id=episode.episode_id,
+                        message="prettifying",
+                        payload={"step": "completed"},
+                        checkpoint={
+                            "status": "completed",
+                            "readable_path": str(readable_path),
+                            "condensed_path": str(condensed_path),
+                        },
+                        artefact_paths={"readable": readable_path, "condensed": condensed_path},
+                    )
+                    return {"readable_path": readable_path, "condensed_path": condensed_path}
 
-            return generator()
+                return generator()
+            
+            def get_outputs(self):
+                return {
+                    "readable_path": self._last_readable_path,
+                    "condensed_path": self._last_condensed_path,
+                }
 
     class StubThematizer:
         def __init__(self, *args, **kwargs):
@@ -292,30 +323,51 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
     captured_events: list[PipelineEvent] = []
 
     class StubAdapter:
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, store, episode_id=None, pipeline_id=None):
+            self.store = store
+            self._episode_id = episode_id
+            self._pipeline_id = pipeline_id
 
         def process(self, event: PipelineEvent):
             captured_events.append(event)
+            # Actually store checkpoints like the real adapter does
+            from mywhisper.checkpoints.models import PipelineCheckpoint
+            episode_id = event.episode_id or self._episode_id
+            step = event.step_name or event.stage
+            status = (event.checkpoint or {}).get("status") or event.stage
+            checkpoint = PipelineCheckpoint(
+                pipeline_id=self._pipeline_id,
+                episode_id=episode_id,
+                step=step,
+                status=status,
+                stage=event.stage,
+                message=event.message,
+                payload=dict(event.payload),
+                details=dict(event.checkpoint),
+                artefact_paths={name: str(path) for name, path in event.artefact_paths.items()},
+                elapsed=event.elapsed,
+            )
+            self.store.upsert(checkpoint)
+            return checkpoint
 
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.PodcastTranscriber.from_config",
+        "mywhisper.transcribe.PodcastTranscriber.from_config",
         classmethod(lambda cls, episode, config: StubTranscriber()),
     )
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.DiarizationPipeline.from_config",
+        "mywhisper.diarize.DiarizationPipeline.from_config",
         classmethod(lambda cls, episode, config: StubDiarizationPipeline()),
     )
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.TranscriptAssigner.from_config",
+        "mywhisper.assign.TranscriptAssigner.from_config",
         classmethod(lambda cls, episode, config: StubAssigner()),
     )
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.TranscriptPrettifier",
+        "mywhisper.prettify.TranscriptPrettifier",
         StubPrettifier,
     )
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.EpisodeThematizer",
+        "mywhisper.thematize.EpisodeThematizer",
         StubThematizer,
     )
     monkeypatch.setattr("mywhisper.myw.services.pipeline.PipelineEventAdapter", StubAdapter)
@@ -419,11 +471,11 @@ def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path)
             return generator()
 
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.TranscriptAssigner.from_config",
+        "mywhisper.assign.TranscriptAssigner.from_config",
         classmethod(lambda cls, episode, config: StubAssigner()),
     )
     monkeypatch.setattr(
-        "mywhisper.myw.services.pipeline.TranscriptPrettifier",
+        "mywhisper.prettify.TranscriptPrettifier",
         StubPrettifier,
     )
 
@@ -574,7 +626,7 @@ def test_read_transcript_supports_legacy_speaker_field(tmp_path):
     ]
     transcript_path.write_text(json.dumps(payload))
 
-    segments = runner._read_transcript(transcript_path)
+    segments = read_transcript(transcript_path)
     assert segments
     assert segments[0].speaker_id == "S0"
 
@@ -590,7 +642,7 @@ def test_apply_diarization_labels_assigns_ids(tmp_path):
         DiarizedTurn(start=1.2, end=2.5, speaker_id="SPK1"),
     ]
 
-    labelled = runner._apply_diarization_labels(segments, turns)
+    labelled = apply_diarization_labels(segments, turns)
     assert labelled[0].speaker_id == "SPK0"
     assert labelled[1].speaker_id == "SPK1"
 

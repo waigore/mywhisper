@@ -13,6 +13,8 @@
 - **Observability:** every user action and pipeline transition is logged/audited.
 - **Modular boundaries:** keep UI, queue orchestration, and I/O integrations independent.
 
+**Note:** All code must adhere to the [Clean Coding Principles](clean_coding_principles.md), which enforce abstraction/delegation patterns, guard clause usage for control flow, and module-level imports.
+
 ## Architecture
 
 - Textual app boots env/logging, instantiates screens plus services: `CatalogService`, `QueueController`, `PipelineRunner`.
@@ -103,6 +105,72 @@ Business logic resides in services; UI components remain thin/testable.
 - Queue persistence can evolve (e.g., richer SQLite schema) by swapping `QueueController`.
 - New pipeline steps register in a step registry consumed by `PipelineRunner`.
 - Message bus hooks can forward progress to WebSocket/notification listeners.
+
+### Step Registry Implementation
+
+The step registry (`mywhisper/myw/services/steps.py`) provides a declarative way to define pipeline steps and their execution logic. The design emphasizes complete encapsulation of step-specific behavior within Step classes, allowing `PipelineRunner._process_episode()` to function as a pure orchestrator with no hardcoded step name references.
+
+#### Step Interface
+
+The **Step** abstract base class defines the interface for all pipeline steps:
+
+- `name`: step identifier (e.g., "transcribe", "diarize")
+- `should_run()`: determines if step should execute based on plan, completed steps, and resume flag
+- `get_dependencies()`: returns step names this step depends on
+- `load_dependencies()`: loads required inputs from checkpoints
+- `prepare_inputs()`: prepares execution inputs from dependencies and context. All step-specific execution parameters (including special requirements like episode objects) should be prepared here, not hardcoded in the orchestrator
+- `load_artefact()`: loads step's own artefact from checkpoint if completed. For steps producing multiple outputs, this should return structured data (e.g., a dictionary with multiple paths)
+- `create_config()`: creates step-specific configuration from `MywConfig`
+- `create_executor()`: creates executor instance for the step. Steps that require a catalog should request it here via the optional `catalog` parameter
+- `execute()`: executes the step and yields `PipelineEvent` objects. All execution parameters come from `prepare_inputs()`, ensuring a uniform interface
+
+#### Step Registry Components
+
+- **STEP_ORDER** tuple defines canonical execution order: `("transcribe", "diarize", "prettify", "thematize", "classify", "vocative", "assign")`
+- **get_step()** factory function creates step instances by name
+- Steps are self-contained and handle their own execution, dependencies, checkpoint loading, and input preparation
+
+#### Pipeline Orchestration
+
+`PipelineRunner._process_episode()` is a pure orchestrator that:
+
+- Iterates through steps in `STEP_ORDER`
+- For each step, determines if it's needed (either in the plan or required by a downstream step in the plan)
+- Delegates all step-specific logic to the steps themselves:
+  - Dependency loading via `load_dependencies()`
+  - Input preparation via `prepare_inputs()`
+  - Execution via `execute()`
+  - Artefact loading via `load_artefact()`
+- Merges outputs from previously executed steps into the dependencies dictionary, allowing steps to use fresh outputs from the same execution
+- Handles generic event consumption, logging, and stop conditions
+- Performs generic validation through the step metadata registry
+- Contains no hardcoded step name references (except in `_completion_message` mapping for user-facing messages)
+- Uses guard clauses to maintain maximum 2 levels of nesting (per [Clean Coding Principles](clean_coding_principles.md))
+
+#### Step Outputs and Dependencies
+
+The orchestrator maintains a `step_outputs` dictionary that tracks results from steps executed in the current run. After loading dependencies from checkpoints, outputs from previously executed steps in the same run are merged into the dependencies dictionary. This allows steps to use both:
+- Cached artefacts from previous runs (loaded from checkpoints)
+- Fresh outputs from steps that just executed in the current run
+
+#### Multi-Output Steps
+
+Steps that produce multiple outputs (e.g., prettify producing both `readable_path` and `condensed_path`) should:
+- Return structured data (dictionary) from `load_artefact()` containing all outputs
+- Yield complete checkpoint data in events that includes all output paths
+- Handle extraction of individual outputs within the step's own logic, not in the orchestrator
+
+#### Step Needed Determination
+
+A step is considered "needed" if:
+- It is explicitly in the execution plan, OR
+- A downstream step in the plan depends on it (determined by checking `get_dependencies()`)
+
+This enables automatic execution of prerequisite steps without requiring them to be explicitly included in the plan.
+
+#### Implementation Note
+
+The current implementation contains some hardcoded step name references in areas such as catalog passing, execution parameter handling, multi-output extraction, summary generation, and validation kwargs mapping. These should be refactored to move all step-specific logic into the Step classes themselves, with the orchestrator remaining purely generic.
 
 ## Conversational CLI (`mywconv.py`)
 

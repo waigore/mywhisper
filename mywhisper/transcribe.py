@@ -15,6 +15,7 @@ from typing import Any, Generator, Iterable, List, Optional, Sequence
 import logging
 
 from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import AudioChunk, PipelineEvent, PodcastEpisode, TranscriptSegment
 
 import torch
@@ -36,7 +37,7 @@ class TranscriptionConfig:
     model_path: Path
     language: str = "en"
     target_sample_rate: int = 16000
-    chunk_duration: Optional[float] = None
+    chunk_duration: Optional[float] = 600.0
     chunk_overlap: float = 0.0
     output_dir: Path = field(default_factory=lambda: ensure_data_subdir("transcripts"))
     extract_dir: Path = field(default_factory=lambda: ensure_data_subdir("audio_chunks"))
@@ -62,7 +63,7 @@ class TranscriptionConfig:
         return ensure_data_subdir(f"audio_chunks/{slug}/{key}", self.data_root)
 
 
-class WhisperModelFactory:
+class WhisperModelFactory(LoggingBase):
     """
     Factory responsible for creating Whisper model instances.
     """
@@ -75,7 +76,7 @@ class WhisperModelFactory:
         return Model(str(config.model_path), language=config.language, print_realtime=False)
 
 
-class AudioChunker:
+class AudioChunker(LoggingBase):
     """
     Create audio chunks suitable for Whisper transcription.
     """
@@ -162,7 +163,7 @@ class AudioChunker:
             index += 1
 
 
-class PodcastTranscriber:
+class PodcastTranscriber(LoggingBase):
     """
     Pipeline class orchestrating podcast transcription via Whisper.
     """

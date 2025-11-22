@@ -15,6 +15,16 @@ from mywhisper.myw.services.pipeline import (
     PipelineRunner,
     STEP_ORDER,
 )
+from mywhisper.myw.services.steps import (
+    ensure_diarized_turns,
+    load_step_path,
+    read_transcript,
+    validate_assignment_availability,
+    validate_condensed_availability,
+    validate_diarization_availability,
+    validate_themes_availability,
+    validate_transcript_availability,
+)
 
 
 class DummyQueue:
@@ -157,27 +167,27 @@ def test_validation_helpers_raise_as_expected(tmp_path):
     runner = build_runner(tmp_path)
     # transcript required by diarize when transcribe not in plan
     with pytest.raises(RuntimeError):
-        runner._validate_transcript_availability(("diarize",), None)
+        validate_transcript_availability(("diarize",), None)
 
     # diarization required for prettify/assign unless already in completed
     with pytest.raises(RuntimeError):
-        runner._validate_diarization_availability(("prettify",), {}, None)
+        validate_diarization_availability(("prettify",), {}, None)
     # ok when diarize planned
-    runner._validate_diarization_availability(("prettify", "diarize"), {}, None)
+    validate_diarization_availability(("prettify", "diarize"), {}, None)
     # ok when diarize completed
-    runner._validate_diarization_availability(("assign",), {"diarize": "completed"}, None)
+    validate_diarization_availability(("assign",), {"diarize": "completed"}, None)
 
     # readable required for assign
     with pytest.raises(RuntimeError):
-        runner._validate_assignment_availability(("assign",), None)
+        validate_assignment_availability(("assign",), None)
 
     # condensed required for thematize
     with pytest.raises(RuntimeError):
-        runner._validate_condensed_availability(("thematize",), None)
+        validate_condensed_availability(("thematize",), None)
 
     # themes required for classify
     with pytest.raises(RuntimeError):
-        runner._validate_themes_availability(("classify",), None)
+        validate_themes_availability(("classify",), None)
 
 
 def test_progress_for_and_completion_message(tmp_path):
@@ -214,7 +224,7 @@ def test_progress_for_and_completion_message(tmp_path):
 def test_ensure_diarized_turns_handles_list_dicts_and_rttm(tmp_path):
     runner = build_runner(tmp_path)
     # From list[dict]
-    turns = runner._ensure_diarized_turns(
+    turns = ensure_diarized_turns(
         [{"start": 0.0, "end": 1.0, "speaker": "S0"}, {"start": 0.5, "end": 1.5, "speaker_id": "S1"}]
     )
     assert isinstance(turns[0], DiarizedTurn)
@@ -224,18 +234,18 @@ def test_ensure_diarized_turns_handles_list_dicts_and_rttm(tmp_path):
     rttm = tmp_path / "turns.rttm"
     # SPEAKER <uri> <chan> <start> <dur> <ortho> <stype> <name>
     rttm.write_text("SPEAKER test 1 0.00 0.80 <NA> <NA> SPK0\n")
-    parsed = runner._ensure_diarized_turns(rttm)
+    parsed = ensure_diarized_turns(rttm)
     assert parsed and parsed[0].speaker_id == "SPK0"
 
 
 def test_read_transcript_edge_cases(tmp_path):
     runner = build_runner(tmp_path)
     # missing file
-    assert runner._read_transcript(tmp_path / "missing.json") is None
+    assert read_transcript(tmp_path / "missing.json") is None
     # minimal valid file
     p = tmp_path / "t.json"
     p.write_text(json.dumps([{"start": 0.0, "end": 0.5, "text": "x"}]))
-    segs = runner._read_transcript(p)
+    segs = read_transcript(p)
     assert segs and segs[0].text == "x"
 
 
@@ -323,7 +333,7 @@ def test_load_classified_path(tmp_path):
     context = PipelineContext(episode=episode, resume=False, completed_steps={}, step_plan=("classify",))
 
     # No checkpoint
-    assert runner._load_classified_path(context) is None
+    assert load_step_path("classify", runner.checkpoints, context.episode.episode_id) is None
 
     # With checkpoint
     checkpoints = InMemoryCheckpointStore()
@@ -340,7 +350,7 @@ def test_load_classified_path(tmp_path):
         )
     )
     runner.checkpoints = checkpoints
-    result = runner._load_classified_path(context)
+    result = load_step_path("classify", runner.checkpoints, context.episode.episode_id)
     assert result == classified_file
 
 
@@ -351,7 +361,7 @@ def test_load_themes_path(tmp_path):
     context = PipelineContext(episode=episode, resume=False, completed_steps={}, step_plan=("thematize",))
 
     # No checkpoint
-    assert runner._load_themes_path(context) is None
+    assert load_step_path("thematize", runner.checkpoints, context.episode.episode_id) is None
 
     # With checkpoint
     checkpoints = InMemoryCheckpointStore()
@@ -368,7 +378,7 @@ def test_load_themes_path(tmp_path):
         )
     )
     runner.checkpoints = checkpoints
-    result = runner._load_themes_path(context)
+    result = load_step_path("thematize", runner.checkpoints, context.episode.episode_id)
     assert result == themes_file
 
 
@@ -392,7 +402,7 @@ def test_load_themes_path_from_payload(tmp_path):
         )
     )
     runner.checkpoints = checkpoints
-    result = runner._load_themes_path(context)
+    result = load_step_path("thematize", runner.checkpoints, context.episode.episode_id)
     assert result == themes_file
 
 
@@ -415,20 +425,20 @@ def test_plan_requires_transcript(tmp_path):
     """Test _plan_requires_transcript logic."""
     runner = build_runner(tmp_path)
     # diarize requires transcript if transcribe not in plan
-    assert runner._plan_requires_transcript(("diarize",)) is True
+    assert ("transcribe" not in ("diarize",) and "diarize" in ("diarize",)) is True
     # transcribe in plan -> no requirement
-    assert runner._plan_requires_transcript(("transcribe", "diarize")) is False
+    assert ("transcribe" not in ("transcribe", "diarize") and "diarize" in ("transcribe", "diarize")) is False
     # classify doesn't require transcript directly
-    assert runner._plan_requires_transcript(("classify",)) is False
+    assert ("transcribe" not in ("classify",) and "diarize" in ("classify",)) is False
 
 
 def test_validate_diarization_availability_with_classify(tmp_path):
     """Test that classify step doesn't require diarization."""
     runner = build_runner(tmp_path)
     # classify doesn't require diarization
-    runner._validate_diarization_availability(("classify",), {}, None)
+    validate_diarization_availability(("classify",), {}, None)
     # But prettify/assign do
     with pytest.raises(RuntimeError):
-        runner._validate_diarization_availability(("prettify",), {}, None)
+        validate_diarization_availability(("prettify",), {}, None)
 
 

@@ -12,8 +12,9 @@ from mywhisper.myw.logging import setup_logging
 from mywhisper.myw.messages import PipelineCompleted, PipelineProgress, PipelineStopped
 from mywhisper.myw.models import EpisodeViewState, PipelineStatus
 from mywhisper.myw.services.catalog import CatalogService
-from mywhisper.myw.services.pipeline import PipelineRunner, STEP_ORDER
+from mywhisper.myw.services.pipeline import PipelineRunner
 from mywhisper.myw.services.queue import QueueController
+from mywhisper.myw.services.steps import STEP_ORDER
 from mywhisper.podcasts import PodcastCatalog
 from uuid import uuid4
 

@@ -21,6 +21,7 @@
 ---
 
 ### Core Principles
+- **Clean Coding:** All code must adhere to the [Clean Coding Principles](clean_coding_principles.md), which enforce abstraction/delegation patterns, guard clause usage for control flow (max 2 levels of nesting), and module-level imports (no inline imports).
 - Keep submodules cohesive, class-based, and factory-backed (`from_config` hides model and IO setup).
 - Emit work as generators returning `PipelineEvent` structures when `yield_progress=True`.
 - Use the Apple Podcasts cache path stored on `PodcastEpisode.source_path`; never copy `xxxx.mp3` into `mywhisper` data directories except for temporary derived chunks.
@@ -43,6 +44,7 @@
 - Module: `mywhisper/transcribe.py` exporting `TranscriptionConfig` + `PodcastTranscriber`.
 - Responsibilities: normalize cached audio (downmix + resample), invoke Whisper.cpp models, persist transcripts as `{episode_key}_whisper.json`, and optionally reuse cached segments.
 - Key classes: `TranscriptionConfig` (paths, language, chunking, device), `WhisperModelFactory`, `AudioChunker`, and `PodcastTranscriber`.
+- Configuration: `chunk_duration` defaults to 600.0 seconds (10 minutes); when set, audio is split into chunks of this duration with optional overlap. When `None` or unset, the entire audio is processed as a single chunk.
 - Artefacts: chunk WAVs (only when chunking), transcript JSON aligned with example schema.
 
 ### Diarize Step
@@ -144,6 +146,27 @@ Each stage resumes from artefacts identified by the episode key and records outp
 - All pipelines emit `PipelineEvent(stage, step_name, payload, elapsed)` objects and may forward them through callbacks.
 - Modules inherit logging configuration from `mywhisper` unless callers override per class.
 - Metrics (elapsed time per stage, artefact paths) remain minimal but standardized within the event payloads.
+
+### Automatic Function Logging
+All functions automatically log their inputs and outputs at appropriate log levels:
+- **INFO level** for externally callable functions (public methods without underscore prefix)
+- **DEBUG level** for internal functions (private methods with underscore prefix like `_method_name`)
+
+**Implementation:**
+- Classes automatically inherit logging behavior via `LoggingBase` base class or `LoggingMeta` metaclass from `mywhisper.logging_utils`
+- Standalone functions use the `@log_function` decorator from `mywhisper.logging_utils`
+- Log level determination:
+  - Public methods (no `_` prefix): logged at INFO
+  - Private methods (`_` prefix): logged at DEBUG
+  - Manual override: decorator parameters can override default log level
+- Input/output serialization:
+  - Default: summarized format (type, size, key attributes for complex objects)
+  - Configurable: per-function configuration via decorator parameters
+  - Exceptions are not logged; they propagate normally
+- Applies automatically to all classes via metaclass or base class inheritance
+- Generator functions log entry/exit but not individual yields
+- Async functions are supported
+- Properties and classmethods are handled appropriately
 
 ---
 

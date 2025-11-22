@@ -8,7 +8,7 @@ import time
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence, Tuple, Union
 
 import json
 import logging
@@ -19,6 +19,7 @@ import requests
 import spacy
 
 from .config import ensure_data_subdir, ensure_episode_subdir, resolve_data_root
+from .logging_utils import LoggingBase
 from .models import (
     PipelineEvent,
     PodcastEpisode,
@@ -58,7 +59,7 @@ class AssignmentConfig:
         return dir_path / f"{key}_with_names.json"
 
 
-class SpeakerProfileBuilder:
+class SpeakerProfileBuilder(LoggingBase):
     """
     Construct speaker profiles from transcript segments.
     """
@@ -88,7 +89,7 @@ class SpeakerProfileBuilder:
         return profiles
 
 
-class CandidateRoster:
+class CandidateRoster(LoggingBase):
     """
     Build candidate roster from metadata and NLP hints.
     """
@@ -420,7 +421,7 @@ class SpeakerInferenceEngine:
         return self._UNQUOTED_SPEAKER_ID.sub(repl, payload)
 
 
-class TranscriptAssigner:
+class TranscriptAssigner(LoggingBase):
     """
     End-to-end pipeline for assigning speaker names to transcript segments.
     """
@@ -436,6 +437,9 @@ class TranscriptAssigner:
         self.config = config
         self.inference_engine = inference_engine
         self.logger = logger or LOGGER.getChild(podcast.episode_id)
+        self._last_assignment_path: Optional[Path] = None
+        self._last_episode_key: Optional[str] = None
+        self._last_artefact_key: Optional[str] = None
 
     @classmethod
     def from_config(
@@ -448,12 +452,34 @@ class TranscriptAssigner:
         inference_engine = SpeakerInferenceEngine(config, engine_client)
         return cls(podcast=podcast, config=config, inference_engine=inference_engine)
 
+    def get_assignment_path(self) -> Optional[Path]:
+        """
+        Get the assignment path from the last execution.
+        
+        Returns:
+            Path to the assignment file, or None if not yet executed.
+        """
+        return self._last_assignment_path
+
+    def get_outputs(self) -> Dict[str, Any]:
+        """
+        Get all outputs from assign execution.
+        
+        Returns:
+            Dictionary with transcript_segments and assignment_path keys.
+            Values may be None if execution hasn't completed.
+        """
+        return {
+            "transcript_segments": None,  # Will be populated from result
+            "assignment_path": self._last_assignment_path,
+        }
+
     def assign_from_readable(
         self,
         readable_path: Path,
         metadata: Optional[Dict[str, str]] = None,
         yield_progress: bool = False,
-    ) -> List[TranscriptSegment] | Generator[PipelineEvent, None, List[TranscriptSegment]]:
+    ) -> Dict[str, Any] | Generator[PipelineEvent, None, Dict[str, Any]]:
         """
         Accept a prettified transcript (readable .txt) and infer real speaker names.
         This parses lines of the form '<label> (<speaker_id>): <text>' to reconstruct
@@ -475,7 +501,7 @@ class TranscriptAssigner:
         segments: Sequence[TranscriptSegment],
         metadata: Optional[Dict[str, str]] = None,
         yield_progress: bool = False,
-    ) -> List[TranscriptSegment] | Generator[PipelineEvent, None, List[TranscriptSegment]]:
+    ) -> Dict[str, Any] | Generator[PipelineEvent, None, Dict[str, Any]]:
         pipeline = self._assign_pipeline(segments, metadata or {})
         if yield_progress:
             return pipeline
@@ -494,7 +520,7 @@ class TranscriptAssigner:
         self,
         segments: Sequence[TranscriptSegment],
         metadata: Dict[str, str],
-    ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
+    ) -> Generator[PipelineEvent, None, Dict[str, Any]]:
         episode_key = self.podcast.episode_key
         assignment_path = self.config.assignment_path(self.podcast, episode_key)
         start_time = time.perf_counter()
@@ -733,13 +759,16 @@ class TranscriptAssigner:
             elapsed=elapsed,
         )
 
-        return enriched_segments
+        return {
+            "transcript_segments": enriched_segments,
+            "assignment_path": assignment_path,
+        }
 
     def _assign_from_readable_pipeline(
         self,
         readable_path: Path,
         metadata: Dict[str, str],
-    ) -> Generator[PipelineEvent, None, List[TranscriptSegment]]:
+    ) -> Generator[PipelineEvent, None, Dict[str, Any]]:
         episode_key = self.podcast.episode_key
         start_time = time.perf_counter()
         self.logger.info(
@@ -770,17 +799,20 @@ class TranscriptAssigner:
         segments = self._segments_from_readable(readable_path)
         # Delegate to the core pipeline for inference + persistence
         generator = self._assign_pipeline(segments, metadata)
-        enriched: Optional[List[TranscriptSegment]] = None
+        enriched_result: Optional[Dict[str, Any]] = None
         try:
             while True:
                 event = next(generator)
                 yield event
         except StopIteration as stop:
-            enriched = stop.value
+            enriched_result = stop.value
 
         # Update readable labels with inferred names
+        enriched_segments = None
+        if enriched_result:
+            enriched_segments = enriched_result.get("transcript_segments")
         id_to_name: Dict[str, str] = {}
-        for seg in enriched or []:
+        for seg in enriched_segments or []:
             sid = (seg.speaker_id or "").strip()
             name = (seg.speaker_name or "").strip()
             if sid and name:
@@ -806,6 +838,11 @@ class TranscriptAssigner:
                 },
                 elapsed=elapsed,
             )
+        
+        # Return the result from _assign_pipeline (already includes both outputs)
+        if enriched_result:
+            return enriched_result
+        return {"transcript_segments": None, "assignment_path": None}
 
         return enriched or []
 
