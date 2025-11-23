@@ -139,7 +139,7 @@ class EpisodeThematizer(LoggingBase):
         segment_count = len(segments)
 
         enriched: List[dict] = []
-        failure_reason: Optional[str] = None
+        failure_count = 0
 
         for index, seg in enumerate(segments):
             try:
@@ -157,9 +157,10 @@ class EpisodeThematizer(LoggingBase):
                 )
             except Exception as exc:  # pragma: no cover - fallback path exercised separately
                 failure_reason = str(exc)
+                failure_count += 1
                 self.logger.warning("LLM generation failed on segment %d: %s", index, exc)
-                enriched = []
-                break
+                # Use fallback for this segment but preserve transcript data
+                enriched.append(self._create_fallback_segment(seg, index, failure_reason))
 
             yield PipelineEvent(
                 stage="thematize",
@@ -178,7 +179,14 @@ class EpisodeThematizer(LoggingBase):
             )
 
         if not enriched:
-            enriched = self._fallback_segments(failure_reason)
+            # Only use full fallback if no segments were processed at all
+            enriched = self._fallback_segments(None)
+        elif failure_count > 0:
+            self.logger.warning(
+                "Completed thematization with %d fallback segments out of %d total",
+                failure_count,
+                len(enriched),
+            )
 
         themes_path.parent.mkdir(parents=True, exist_ok=True)
         themes_path.write_text(json.dumps(enriched, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -323,7 +331,23 @@ class EpisodeThematizer(LoggingBase):
             )
         return sections
 
+    def _create_fallback_segment(self, segment: dict, segment_index: int, reason: Optional[str]) -> dict:
+        """Create a fallback segment preserving the original transcript data."""
+        summary = "Theme generation unavailable for this segment."
+        if reason:
+            summary = f"{summary} LLM error: {reason}"
+        return {
+            "start": float(segment.get("start", 0.0)),
+            "end": float(segment.get("end", 0.0)),
+            "speaker_id": str(segment.get("speaker_id") or "UNKNOWN"),
+            "speaker_name": str(segment.get("speaker_name") or segment.get("speaker_id") or "UNKNOWN"),
+            "text": str(segment.get("text") or "").strip(),
+            "theme": self.config.fallback_theme,
+            "summary": summary,
+        }
+
     def _fallback_segments(self, reason: Optional[str]) -> List[dict]:
+        """Create a single fallback segment when no transcript data is available."""
         summary = "Transcript unavailable."
         if reason:
             summary = f"{summary} LLM fallback reason: {reason}"

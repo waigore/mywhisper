@@ -63,10 +63,13 @@
 
 ### Assign Step
 - Module: `mywhisper/assign.py` exporting `AssignmentConfig` + `TranscriptAssigner`.
-- Responsibilities: merge transcripts + diarization, build speaker profiles, gather candidate names, drive LLM-based inference (default Ollama), and persist `{episode_key}_with_names.json`.
-- Key classes: `AssignmentConfig`, `SpeakerProfileBuilder`, `CandidateRoster`, `LLMClient`/`OllamaClient`, `SpeakerInferenceEngine`.
-- Behaviour: enforce confidence threshold (fallback `"UNKNOWN"`), support iterative refinement, expose generator progress hooks.
-- Artefacts: enriched transcript JSON, optional CSV analytics export.
+- Responsibilities: infer speaker names from vocatives using graph-based bipartite matching and contextual turn-taking inference, persist `{episode_key}_inferred_names.json`.
+- Key classes: `AssignmentConfig`, `GraphBasedInference`, `ContextualTurnInference`, `TranscriptAssigner`.
+- Behaviour: 
+  - Graph-based inference: when a speaker uses a vocative, creates edges from OTHER speakers (next speaker with weight 1.0, previous speaker with weight 0.5) to that vocative, since the speaker using the vocative is addressing someone else. Builds bipartite graph (speakers ↔ vocatives), uses maximum weighted matching to assign vocatives to speakers, calculates confidence as edge weight relative to total weights from speaker. **Important constraint**: A speaker cannot be assigned a name they use as a vocative themselves (when SPEAKER_X addresses "Name" as a vocative, they're talking to someone else, so SPEAKER_X should NOT be assigned "Name"). Invalid edges are excluded from the graph before matching.
+  - Contextual turn-taking inference: iterates sequentially through segments, boosts scores for next speaker (1.0) and previous speaker (0.5) when vocative is found, uses softmax normalization for confidence.
+  - Outputs separate JSON with graph and context inferences for each speaker, including sentences containing matched vocatives.
+- Artefacts: `{episode_key}_inferred_names.json` containing speaker list with graph/context inferences and associated sentences.
 
 ### Thematize Step
 - Module: `mywhisper/thematize.py` exposing `ThematizeConfig` + `EpisodeThematizer`.
@@ -136,7 +139,7 @@
 5. **Thematize** by segment using the condensed JSON, yielding `{episode_key}_with_themes.json`.
 6. **Classify** segments using zero-shot classification to identify non-editorial content, yielding `{episode_key}_classified.json`.
 7. **Detect vocatives** by segment using SpaCy NER and dependency parsing with punctuation-based heuristics, followed by LLM classification, yielding `{episode_key}_vocative.json` with `addressed_person_candidates` field.
-8. **Assign speakers** via `SpeakerInferenceEngine` (using the readable transcript) to infer real names, yielding `{episode_key}_with_names.json` and an updated readable transcript with names.
+8. **Assign speakers** via graph-based and contextual inference (using vocative data) to infer real names, yielding `{episode_key}_inferred_names.json` with separate graph and context inferences for each speaker.
 
 Each stage resumes from artefacts identified by the episode key and records outputs in the catalog for traceability.
 

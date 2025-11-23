@@ -75,7 +75,7 @@ Business logic resides in services; UI components remain thin/testable.
   4. Thematize (turn readable transcript into `_themes.json`)
   5. Classify (zero-shot classification to identify non-editorial content, producing `_classified.json`)
   6. Vocative (detect direct named addresses using SpaCy NER and dependency parsing with LLM classification, producing `_vocative.json` with `addressed_person_candidates` field containing array of candidate objects with `name`, `classification`, `justification`, and `sentence` fields; each occurrence of the same name within a segment is tracked and classified separately)
-  7. Assign (LLM-produced real speaker names; consumes the prettified transcript and updates names in the readable)
+  7. Assign (graph-based and contextual inference to infer speaker names from vocatives; consumes vocative JSON and produces `{episode_key}_inferred_names.json` with separate graph and context inferences)
 - Stage gating:
   - Prettify requires diarization artefacts.
   - Thematize requires a condensed transcript produced by prettify.

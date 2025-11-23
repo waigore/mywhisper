@@ -226,3 +226,178 @@ def test_audio_chunker_iterate_chunks(tmp_path, monkeypatch):
     assert len(chunks) >= 1
     assert writes
 
+
+def test_audio_chunker_stereo_audio(tmp_path, monkeypatch):
+    """Test AudioChunker handles stereo audio (hits line 110)."""
+    config = TranscriptionConfig(
+        model_path=tmp_path / "model.bin",
+        data_root=tmp_path / "data",
+        chunk_duration=None,  # Single chunk mode
+        target_sample_rate=16000,
+    )
+    chunker = AudioChunker(config)
+
+    # Create stereo waveform (2 channels)
+    waveform = torch.arange(0, 40, dtype=torch.float32).view(2, 20)
+
+    monkeypatch.setattr(
+        "mywhisper.transcribe.torchaudio.load",
+        lambda _path: (waveform.clone(), 16000),
+    )
+
+    podcast = PodcastEpisode(
+        episode_id="episode-stereo",
+        show_title="Show",
+        episode_title="Stereo Episode",
+        source_path=Path("dummy.wav"),
+        metadata={"episode_key": "stereo123"},
+    )
+
+    chunks = list(chunker.iterate_chunks(podcast, podcast.episode_key))
+    assert len(chunks) == 1  # Single chunk when chunk_duration is None
+
+
+def test_audio_chunker_resampling(tmp_path, monkeypatch):
+    """Test AudioChunker resamples audio (hits lines 114-119)."""
+    config = TranscriptionConfig(
+        model_path=tmp_path / "model.bin",
+        data_root=tmp_path / "data",
+        chunk_duration=None,
+        target_sample_rate=16000,  # Different from source
+    )
+    chunker = AudioChunker(config)
+
+    waveform = torch.arange(0, 20, dtype=torch.float32).view(1, -1)
+
+    # Source sample rate is different from target
+    monkeypatch.setattr(
+        "mywhisper.transcribe.torchaudio.load",
+        lambda _path: (waveform.clone(), 8000),  # 8kHz source
+    )
+
+    # Mock Resample
+    resample_calls = []
+    original_resample = None
+    try:
+        from torchaudio.transforms import Resample
+        original_resample = Resample
+
+        class MockResample:
+            def __init__(self, orig_freq, new_freq):
+                resample_calls.append((orig_freq, new_freq))
+
+            def __call__(self, waveform):
+                return waveform  # Return as-is for test
+
+        monkeypatch.setattr("mywhisper.transcribe.torchaudio.transforms.Resample", MockResample)
+    except ImportError:
+        pass
+
+    podcast = PodcastEpisode(
+        episode_id="episode-resample",
+        show_title="Show",
+        episode_title="Resample Episode",
+        source_path=Path("dummy.wav"),
+        metadata={"episode_key": "resample123"},
+    )
+
+    chunks = list(chunker.iterate_chunks(podcast, podcast.episode_key))
+    assert len(chunks) == 1
+    if original_resample:
+        assert len(resample_calls) > 0
+        assert resample_calls[0] == (8000, 16000)
+
+
+def test_audio_chunker_single_chunk_mode(tmp_path, monkeypatch):
+    """Test AudioChunker single chunk mode when chunk_duration is None (hits lines 125-133)."""
+    config = TranscriptionConfig(
+        model_path=tmp_path / "model.bin",
+        data_root=tmp_path / "data",
+        chunk_duration=None,  # Single chunk mode
+        target_sample_rate=16000,
+    )
+    chunker = AudioChunker(config)
+
+    waveform = torch.arange(0, 16000, dtype=torch.float32).view(1, -1)  # 1 second at 16kHz
+
+    monkeypatch.setattr(
+        "mywhisper.transcribe.torchaudio.load",
+        lambda _path: (waveform.clone(), 16000),
+    )
+
+    podcast = PodcastEpisode(
+        episode_id="episode-single",
+        show_title="Show",
+        episode_title="Single Chunk Episode",
+        source_path=Path("dummy.wav"),
+        metadata={"episode_key": "single123"},
+    )
+
+    chunks = list(chunker.iterate_chunks(podcast, podcast.episode_key))
+    assert len(chunks) == 1
+    assert chunks[0].global_start == 0.0
+    assert chunks[0].global_end > 0.0
+
+
+# Note: Line 139 (ValueError for chunk_samples <= 0) is unreachable in practice
+# because line 136 enforces chunk_duration = max(self.chunk_duration, 0.1),
+# which ensures chunk_samples will always be > 0 for any reasonable sample_rate
+
+
+# Note: Line 229 (ValueError for no episode key) is difficult to test because
+# episode_key is a computed property that falls back to metadata values.
+# This edge case would require more complex mocking.
+
+
+def test_transcriber_chunk_tensor_none(tmp_path, monkeypatch):
+    """Test _transcribe_chunk loads waveform when tensor is None (hits lines 378-382)."""
+    transcriber = build_transcriber(tmp_path)
+
+    # Create chunk without tensor
+    chunk = AudioChunk(
+        path=tmp_path / "chunk.wav",
+        global_start=0.0,
+        global_end=2.0,
+        tensor=None,
+        sample_rate=16000,
+    )
+
+    waveform = torch.arange(0, 32000, dtype=torch.float32).view(1, -1)  # 2 seconds at 16kHz
+
+    monkeypatch.setattr(
+        "mywhisper.transcribe.torchaudio.load",
+        lambda _path: (waveform.clone(), 16000),
+    )
+
+    # Mock the model's transcribe method
+    segments = []
+    transcriber.model.transcribe = lambda audio_np, language, new_segment_callback=None: segments
+
+    # This should load the waveform from the path
+    result = list(transcriber._transcribe_chunk(chunk, 0))
+    # Should not raise an error and should have loaded the tensor
+    assert chunk.tensor is not None
+
+
+def test_transcriber_chunk_tensor_multidim(tmp_path):
+    """Test _transcribe_chunk handles multi-dimensional tensor (hits line 386)."""
+    transcriber = build_transcriber(tmp_path)
+
+    # Create chunk with 2D tensor (needs squeezing)
+    tensor_2d = torch.arange(0, 32000, dtype=torch.float32).view(1, -1)
+    chunk = AudioChunk(
+        path=tmp_path / "chunk.wav",
+        global_start=0.0,
+        global_end=2.0,
+        tensor=tensor_2d,
+        sample_rate=16000,
+    )
+
+    segments = []
+    transcriber.model.transcribe = lambda audio_np, language, new_segment_callback=None: segments
+
+    # Should handle 2D tensor by squeezing
+    result = list(transcriber._transcribe_chunk(chunk, 0))
+    # Should not raise an error
+    assert True
+

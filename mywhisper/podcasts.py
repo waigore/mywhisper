@@ -498,17 +498,17 @@ class ApplePodcastsImporter:
 
     def _duration_seconds(self, audio_path: Path) -> Optional[float]:
         try:
-            import torchaudio  # type: ignore
+            import soundfile as sf  # type: ignore
         except Exception:  # pragma: no cover
             return None
 
         try:
-            info = torchaudio.info(str(audio_path))
+            info = sf.info(str(audio_path))
         except Exception:  # pragma: no cover - best effort
             return None
-        if not info.num_frames or not info.sample_rate:
+        if not info.frames or not info.samplerate:
             return None
-        return info.num_frames / info.sample_rate
+        return info.frames / info.samplerate
 
     def _find_audio_file(self, entry: Path) -> Optional[Path]:
         if entry.is_file() and entry.suffix.lower() in AUDIO_EXTENSIONS:

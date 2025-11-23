@@ -499,6 +499,78 @@ def test_classifier_multiple_chunks_different_labels(tmp_path):
     assert len(set(labels)) <= len(labels)  # May have duplicates or distinct
 
 
+def test_classifier_split_into_chunks_odd_sentences(tmp_path):
+    """Test _split_into_chunks with odd number of sentences (hits else branch on line 259)."""
+    import re
+    config = ClassifyConfig(data_root=tmp_path / "data")
+    episode = _episode(tmp_path)
+    classifier = EpisodeClassifier(
+        podcast=episode,
+        config=config,
+        catalog=StubCatalog(),
+        classifier=StubClassifier(),
+    )
+    
+    # Create text that results in odd number of elements after re.split
+    # re.split with capturing group: "A. B." -> ['A', '. ', 'B', '.', '']
+    # So we need text ending without delimiter to get odd count
+    # Actually, let's use text with single sentence (no delimiter at end)
+    # "Sentence." -> ['Sentence', '.', ''] - 3 elements, odd
+    # But wait, the loop is range(0, len(sentences) - 1, 2), so it goes: 0, 2, 4...
+    # For ['A', '. ', 'B', '.', ''] with len=5, range(0, 4, 2) = [0, 2]
+    # i=0: i+1=1 < 5, so append sentences[0] + sentences[1] = 'A. '
+    # i=2: i+1=3 < 5, so append sentences[2] + sentences[3] = 'B.'
+    # Then i=4 is not in range, so we're done - no else branch!
+    # To hit else, we need len(sentences) to be odd AND the last index to be in range
+    # Actually, range(0, n-1, 2) means if n is odd, the last valid i might leave one element
+    # Let me try: "A. B" (no final punctuation) -> ['A', '. ', 'B', ''] - 4 elements, even
+    # "A." -> ['A', '.', ''] - 3 elements, odd. range(0, 2, 2) = [0]
+    # i=0: i+1=1 < 3, so append 'A.'
+    # Then i=2 is not in range, but we still have sentences[2]='' left
+    # Wait, the loop condition is i+1 < len(sentences), so for i=0, 1 < 3, so we take it
+    # Then i=2, but 2 is not < 3-1=2, so we don't enter the if, we go to else!
+    # So "A." should work!
+    text = "Single sentence."
+    chunks = classifier._split_into_chunks(text, max_words=100)
+    assert len(chunks) > 0
+    assert "Single sentence" in chunks[0] or "Single sentence." in chunks[0]
+
+
+def test_classifier_get_classifier_success(tmp_path, monkeypatch):
+    """Test _get_classifier successfully creates and returns classifier (hits line 332)."""
+    import sys
+    from unittest.mock import MagicMock
+    
+    config = ClassifyConfig(data_root=tmp_path / "data")
+    episode = _episode(tmp_path)
+    classifier = EpisodeClassifier(
+        podcast=episode,
+        config=config,
+        catalog=StubCatalog(),
+        classifier=None,  # Don't provide a classifier, so it will be created
+    )
+    
+    # Create a mock transformers module with pipeline
+    mock_pipeline_func = MagicMock(return_value=StubClassifier())
+    class MockTransformers:
+        pipeline = mock_pipeline_func
+    
+    # Mock sys.modules to return our mock
+    monkeypatch.setitem(sys.modules, "transformers", MockTransformers())
+    
+    # Clear the classifier cache
+    classifier._classifier = None
+    
+    # Call _get_classifier - this should create the classifier and return it (line 332)
+    result = classifier._get_classifier()
+    assert result is not None
+    assert mock_pipeline_func.called
+    mock_pipeline_func.assert_called_once_with(
+        "zero-shot-classification",
+        model=config.model_name,
+    )
+
+
 def test_classifier_get_classifier_import_error(tmp_path, monkeypatch):
     """Test ImportError handling in _get_classifier."""
     config = ClassifyConfig(data_root=tmp_path / "data")

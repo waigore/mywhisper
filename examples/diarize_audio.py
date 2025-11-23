@@ -1,7 +1,8 @@
 # --------------------------------------------------------------
 #  FULL REUSABLE EMBEDDINGS SCRIPT
 # --------------------------------------------------------------
-import os, joblib, torch, numpy as np, torchaudio
+import os, joblib, torch, numpy as np
+import soundfile as sf
 from typing import Tuple, List, Dict
 from tqdm import tqdm
 from pathlib import Path
@@ -64,8 +65,8 @@ _duration_cache: Dict[str, float] = {}
 def get_duration_seconds(wav: str) -> float:
     wav = str(wav)
     if wav not in _duration_cache:
-        info = torchaudio.info(wav)
-        _duration_cache[wav] = info.num_frames / info.sample_rate
+        info = sf.info(wav)
+        _duration_cache[wav] = info.frames / info.samplerate
     return _duration_cache[wav]
 
 

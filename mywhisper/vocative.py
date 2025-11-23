@@ -113,6 +113,9 @@ class EpisodeVocativeDetector(LoggingBase):
         if not resolved_classified.exists():
             raise FileNotFoundError(f"Classified transcript not found at {resolved_classified}")
 
+        # Validate spaCy model exists before proceeding
+        self._validate_spacy_model()
+
         start_time = time.perf_counter()
         self.logger.info(
             "Vocative detection start | episode=%s | classified=%s | output=%s",
@@ -314,10 +317,6 @@ class EpisodeVocativeDetector(LoggingBase):
             (text[:100] + "..." if text and len(text) > 100 else text) if text else None,
         )
         nlp = self._get_nlp()
-        if not nlp:
-            self.logger.debug("_extract_person_names returning | result=[] (nlp not available)")
-            return []
-
         doc = nlp(text)
         candidates = set()
 
@@ -357,10 +356,6 @@ class EpisodeVocativeDetector(LoggingBase):
             (text[:100] + "..." if text and len(text) > 100 else text) if text else None,
         )
         nlp = self._get_nlp()
-        if not nlp:
-            self.logger.debug("_identify_vocatives returning | result=[] (nlp not available)")
-            return []
-
         doc = nlp(text)
         vocatives = []
         potential_vocatives = set()
@@ -500,12 +495,11 @@ class EpisodeVocativeDetector(LoggingBase):
         # try using spaCy's sentence segmentation as a backup
         if len(result) < len(vocative) + 10:  # Result is suspiciously short
             nlp = self._get_nlp()
-            if nlp:
-                doc = nlp(text)
-                for sent in doc.sents:
-                    if vocative in sent.text:
-                        result = sent.text.strip()
-                        break
+            doc = nlp(text)
+            for sent in doc.sents:
+                if vocative in sent.text:
+                    result = sent.text.strip()
+                    break
 
         self.logger.debug(
             "_extract_sentence_with_vocative returning | result=%s",
@@ -650,15 +644,14 @@ class EpisodeVocativeDetector(LoggingBase):
         # try using spaCy's sentence segmentation as a backup
         if len(result) < len(vocative) + 10:  # Result is suspiciously short
             nlp = self._get_nlp()
-            if nlp:
-                doc = nlp(text)
-                for sent in doc.sents:
-                    # Check if the vocative position is within this sentence's span
-                    sent_start = sent.start_char if hasattr(sent, 'start_char') else 0
-                    sent_end = sent.end_char if hasattr(sent, 'end_char') else len(text)
-                    if sent_start <= vocative_pos < sent_end:
-                        result = sent.text.strip()
-                        break
+            doc = nlp(text)
+            for sent in doc.sents:
+                # Check if the vocative position is within this sentence's span
+                sent_start = sent.start_char if hasattr(sent, 'start_char') else 0
+                sent_end = sent.end_char if hasattr(sent, 'end_char') else len(text)
+                if sent_start <= vocative_pos < sent_end:
+                    result = sent.text.strip()
+                    break
 
         self.logger.debug(
             "_extract_sentence_with_vocative_at_position returning | result=%s",
@@ -745,8 +738,28 @@ class EpisodeVocativeDetector(LoggingBase):
             )
             return {"classification": "UNKNOWN", "justification": f"LLM call failed: {exc}"}
 
-    def _get_nlp(self) -> Optional[Any]:
-        """Lazy-load the SpaCy model."""
+    def _validate_spacy_model(self) -> None:
+        """Validate that the spaCy model exists. Raises RuntimeError if not found."""
+        self.logger.debug(
+            "_validate_spacy_model called | spacy_model=%s",
+            self.config.spacy_model,
+        )
+        try:
+            spacy.load(self.config.spacy_model)
+            self.logger.debug("_validate_spacy_model | model exists")
+        except OSError:
+            raise RuntimeError(
+                f"spaCy model '{self.config.spacy_model}' not found. "
+                f"Please install it with: python -m spacy download {self.config.spacy_model}"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load spaCy model '{self.config.spacy_model}': {exc}. "
+                f"Please install it with: python -m spacy download {self.config.spacy_model}"
+            ) from exc
+
+    def _get_nlp(self) -> Any:
+        """Lazy-load the SpaCy model. Raises RuntimeError if model is not available."""
         self.logger.debug(
             "_get_nlp called | spacy_model=%s | nlp_loaded=%s",
             self.config.spacy_model,
@@ -760,18 +773,14 @@ class EpisodeVocativeDetector(LoggingBase):
             self._nlp = spacy.load(self.config.spacy_model)
             self.logger.debug("_get_nlp returning | result=<nlp_model> (loaded)")
             return self._nlp
-        except OSError:
-            self.logger.warning(
-                "spaCy model %s not found; vocative detection will be limited. Install with: python -m spacy download %s",
-                self.config.spacy_model,
-                self.config.spacy_model,
-            )
-            self._nlp = None
-            self.logger.debug("_get_nlp returning | result=None (OSError)")
-            return None
+        except OSError as exc:
+            raise RuntimeError(
+                f"spaCy model '{self.config.spacy_model}' not found. "
+                f"Please install it with: python -m spacy download {self.config.spacy_model}"
+            ) from exc
         except Exception as exc:
-            self.logger.warning("Failed to load spaCy model: %s", exc, exc_info=exc)
-            self._nlp = None
-            self.logger.debug("_get_nlp returning | result=None (Exception)")
-            return None
+            raise RuntimeError(
+                f"Failed to load spaCy model '{self.config.spacy_model}': {exc}. "
+                f"Please install it with: python -m spacy download {self.config.spacy_model}"
+            ) from exc
 

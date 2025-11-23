@@ -23,6 +23,8 @@ __all__ = [
     "SpeakerNameGuesses",
     "AudioChunk",
     "DiarizedTurn",
+    "InferenceResult",
+    "SpeakerInference",
 ]
 
 
@@ -220,5 +222,23 @@ class DiarizedTurn:
     end: float
     speaker_id: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class InferenceResult:
+    """Single inference result with name and confidence."""
+
+    name: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class SpeakerInference:
+    """Complete inference results for a speaker."""
+
+    speaker_id: str
+    graph_inference: Optional[InferenceResult] = None
+    context_inference: Optional[InferenceResult] = None
+    sentences: List[str] = field(default_factory=list)
 
 

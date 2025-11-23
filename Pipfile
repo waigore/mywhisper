@@ -18,6 +18,7 @@ textual = "*"
 dotenv = "*"
 librosa = "*"
 omegaconf = "*"
+networkx = "*"
 
 [dev-packages]
 pytest = "*"

@@ -44,6 +44,18 @@ class FailingClient:
         raise RuntimeError("LLM offline")
 
 
+class PartiallyFailingClient:
+    """Client that fails on the second call."""
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, prompt: str) -> str:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("LLM offline")
+        return json.dumps({"theme": "Success", "summary": "This worked."})
+
+
 def test_thematizer_generates_per_segment_summaries(tmp_path, monkeypatch):
     config = ThematizeConfig(data_root=tmp_path / "data")
     episode = _episode(tmp_path)
@@ -92,7 +104,55 @@ def test_thematizer_fallback_on_failure(tmp_path):
     themes_path = thematizer.thematize(condensed_path=condensed_path)
     payload = json.loads(themes_path.read_text(encoding="utf-8"))
     assert payload[0]["theme"] == config.fallback_theme
-    assert "LLM fallback reason" in payload[0]["summary"]
+    assert "LLM error" in payload[0]["summary"]
+    # Verify transcript text is preserved even on failure
+    assert payload[0]["text"] == "Nothing works today."
+    assert payload[0]["start"] == 0.0
+    assert payload[0]["end"] == 1.0
+
+
+def test_thematizer_preserves_transcript_on_partial_failure(tmp_path):
+    """Test that transcript is preserved when some segments fail."""
+    config = ThematizeConfig(data_root=tmp_path / "data")
+    episode = _episode(tmp_path)
+    condensed_path = config.condensed_path(episode)
+    condensed_path.parent.mkdir(parents=True, exist_ok=True)
+    condensed_path.write_text(
+        json.dumps(
+            [
+                {"start": 0.0, "end": 1.0, "speaker_id": "S0", "speaker_name": "Host", "text": "First segment works."},
+                {"start": 1.0, "end": 2.0, "speaker_id": "S1", "speaker_name": "Guest", "text": "Second segment fails."},
+                {"start": 2.0, "end": 3.0, "speaker_id": "S0", "speaker_name": "Host", "text": "Third segment works."},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    thematizer = EpisodeThematizer(
+        podcast=episode,
+        config=config,
+        catalog=StubCatalog(),
+        client=PartiallyFailingClient(),  # type: ignore[arg-type]
+    )
+
+    themes_path = thematizer.thematize(condensed_path=condensed_path)
+    payload = json.loads(themes_path.read_text(encoding="utf-8"))
+    
+    # All three segments should be present
+    assert len(payload) == 3
+    
+    # First segment should have successful theme
+    assert payload[0]["theme"] == "Success"
+    assert payload[0]["text"] == "First segment works."
+    
+    # Second segment should have fallback theme but preserved text
+    assert payload[1]["theme"] == config.fallback_theme
+    assert payload[1]["text"] == "Second segment fails."
+    assert "LLM error" in payload[1]["summary"]
+    
+    # Third segment should have successful theme
+    assert payload[2]["theme"] == "Success"
+    assert payload[2]["text"] == "Third segment works."
 
 
 def test_thematizer_yield_progress(tmp_path):

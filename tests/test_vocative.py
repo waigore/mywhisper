@@ -92,6 +92,27 @@ def test_detect_vocatives_missing_classified_file(tmp_path):
         detector.detect_vocatives()
 
 
+def test_detect_vocatives_missing_spacy_model(tmp_path, monkeypatch):
+    """Test that RuntimeError is raised when spaCy model is not found."""
+    config = VocativeConfig(data_root=tmp_path / "data", spacy_model="en_core_web_md")
+    episode = _episode(tmp_path)
+    detector = EpisodeVocativeDetector(podcast=episode, config=config)
+    
+    # Create classified file so we get past that check
+    classified_path = config.classified_path(episode)
+    classified_path.parent.mkdir(parents=True, exist_ok=True)
+    classified_path.write_text(json.dumps([{"text": "Hello"}]), encoding="utf-8")
+    
+    # Mock spacy.load to raise OSError (model not found)
+    def mock_load(model: str):
+        raise OSError(f"Can't find model '{model}'")
+    
+    monkeypatch.setattr("spacy.load", mock_load)
+    
+    with pytest.raises(RuntimeError, match="spaCy model.*not found"):
+        detector.detect_vocatives()
+
+
 def test_detect_vocatives_empty_segments(tmp_path):
     """Test detection with empty segments."""
     config = VocativeConfig(data_root=tmp_path / "data")
@@ -302,16 +323,18 @@ def test_detect_vocative_in_segment_ner_no_match(tmp_path, monkeypatch):
 
 
 def test_extract_person_names_no_nlp(tmp_path, monkeypatch):
-    """Test _extract_person_names when spaCy model is not available."""
+    """Test _extract_person_names raises RuntimeError when spaCy model is not available."""
     config = VocativeConfig()
     episode = _episode(tmp_path)
     detector = EpisodeVocativeDetector(podcast=episode, config=config)
 
-    # Mock _get_nlp to return None
-    monkeypatch.setattr(detector, "_get_nlp", lambda: None)
+    # Mock _get_nlp to raise RuntimeError (model not found)
+    def mock_get_nlp():
+        raise RuntimeError("spaCy model 'en_core_web_sm' not found. Please install it with: python -m spacy download en_core_web_sm")
+    monkeypatch.setattr(detector, "_get_nlp", mock_get_nlp)
 
-    result = detector._extract_person_names("Hello, John.")
-    assert result == []
+    with pytest.raises(RuntimeError, match="spaCy model.*not found"):
+        detector._extract_person_names("Hello, John.")
 
 
 def test_extract_person_names_with_person_entities(tmp_path, monkeypatch):
@@ -573,15 +596,18 @@ def test_identify_vocatives_sentence_end(tmp_path, monkeypatch):
 
 
 def test_identify_vocatives_no_nlp(tmp_path, monkeypatch):
-    """Test _identify_vocatives returns empty list when NLP is not available."""
+    """Test _identify_vocatives raises RuntimeError when NLP is not available."""
     config = VocativeConfig()
     episode = _episode(tmp_path)
     detector = EpisodeVocativeDetector(podcast=episode, config=config)
 
-    monkeypatch.setattr(detector, "_get_nlp", lambda: None)
+    # Mock _get_nlp to raise RuntimeError (model not found)
+    def mock_get_nlp():
+        raise RuntimeError("spaCy model 'en_core_web_sm' not found. Please install it with: python -m spacy download en_core_web_sm")
+    monkeypatch.setattr(detector, "_get_nlp", mock_get_nlp)
 
-    result = detector._identify_vocatives("Hello, John.")
-    assert result == []
+    with pytest.raises(RuntimeError, match="spaCy model.*not found"):
+        detector._identify_vocatives("Hello, John.")
 
 
 def test_identify_vocatives_no_match(tmp_path, monkeypatch):
@@ -661,7 +687,7 @@ def test_get_nlp_successful_load(tmp_path, monkeypatch):
 
 
 def test_get_nlp_oserror_handling(tmp_path, monkeypatch):
-    """Test _get_nlp handles OSError (model not found)."""
+    """Test _get_nlp raises RuntimeError when model is not found."""
     config = VocativeConfig(spacy_model="en_core_web_sm")
     episode = _episode(tmp_path)
     detector = EpisodeVocativeDetector(podcast=episode, config=config)
@@ -671,13 +697,13 @@ def test_get_nlp_oserror_handling(tmp_path, monkeypatch):
 
     monkeypatch.setattr("spacy.load", mock_load)
 
-    result = detector._get_nlp()
-    assert result is None
+    with pytest.raises(RuntimeError, match="spaCy model.*not found"):
+        detector._get_nlp()
     assert detector._nlp is None
 
 
 def test_get_nlp_general_exception(tmp_path, monkeypatch):
-    """Test _get_nlp handles general exceptions."""
+    """Test _get_nlp raises RuntimeError for general exceptions."""
     config = VocativeConfig()
     episode = _episode(tmp_path)
     detector = EpisodeVocativeDetector(podcast=episode, config=config)
@@ -687,8 +713,8 @@ def test_get_nlp_general_exception(tmp_path, monkeypatch):
 
     monkeypatch.setattr("spacy.load", mock_load)
 
-    result = detector._get_nlp()
-    assert result is None
+    with pytest.raises(RuntimeError, match="Failed to load spaCy model"):
+        detector._get_nlp()
     assert detector._nlp is None
 
 
