@@ -101,7 +101,7 @@ class EpisodeVocativeDetector(LoggingBase):
     # ------------------------------------------------------------------ #
 
     def _pipeline(self, classified_path: Optional[Path]) -> Generator[PipelineEvent, None, Path]:
-        self.logger.info(
+        self.logger.debug(
             "_pipeline called | classified_path=%s",
             classified_path,
         )
@@ -226,7 +226,7 @@ class EpisodeVocativeDetector(LoggingBase):
         )
 
         self._last_vocative_path = vocative_path
-        self.logger.info(
+        self.logger.debug(
             "_pipeline returning | vocative_path=%s | segments_processed=%d",
             vocative_path,
             len(enriched),
@@ -240,19 +240,19 @@ class EpisodeVocativeDetector(LoggingBase):
         Each occurrence of the same name within the segment is processed separately.
         Returns empty list when no candidates found.
         """
-        self.logger.info(
+        self.logger.debug(
             "_detect_vocative_in_segment called | text_length=%d | text_preview=%s",
             len(text) if text else 0,
             (text[:100] + "..." if text and len(text) > 100 else text) if text else None,
         )
         if not text or not text.strip():
-            self.logger.info("_detect_vocative_in_segment returning | result=[] (empty text)")
+            self.logger.debug("_detect_vocative_in_segment returning | result=[] (empty text)")
             return []
 
         # Use NER and dependency parsing to identify vocative candidates (returns unique names)
         unique_vocatives = self._identify_vocatives(text)
         if not unique_vocatives:
-            self.logger.info("_detect_vocative_in_segment returning | result=[] (no candidates found)")
+            self.logger.debug("_detect_vocative_in_segment returning | result=[] (no candidates found)")
             return []
 
         # Find all occurrences of each vocative name in the text
@@ -274,7 +274,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         "justification": classification_result.get("justification", ""),
                         "sentence": sentence
                     })
-                    self.logger.info(
+                    self.logger.debug(
                         "_detect_vocative_in_segment | candidate=%s | position=%d | classification=%s | justification=%s",
                         vocative_name,
                         position,
@@ -295,7 +295,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         "sentence": ""
                     })
 
-        self.logger.info(
+        self.logger.debug(
             "_detect_vocative_in_segment returning | result=%s | count=%d",
             results,
             len(results),
@@ -308,14 +308,14 @@ class EpisodeVocativeDetector(LoggingBase):
         Returns a list of candidate person names.
         Only includes proper nouns that are labeled as PERSON entities.
         """
-        self.logger.info(
+        self.logger.debug(
             "_extract_person_names called | text_length=%d | text_preview=%s",
             len(text) if text else 0,
             (text[:100] + "..." if text and len(text) > 100 else text) if text else None,
         )
         nlp = self._get_nlp()
         if not nlp:
-            self.logger.info("_extract_person_names returning | result=[] (nlp not available)")
+            self.logger.debug("_extract_person_names returning | result=[] (nlp not available)")
             return []
 
         doc = nlp(text)
@@ -338,7 +338,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         candidates.add(token.text)
 
         result = sorted(list(candidates))
-        self.logger.info(
+        self.logger.debug(
             "_extract_person_names returning | result=%s | count=%d",
             result,
             len(result),
@@ -351,14 +351,14 @@ class EpisodeVocativeDetector(LoggingBase):
         
         Returns a list of all identified vocative candidates (person names), empty list if none found.
         """
-        self.logger.info(
+        self.logger.debug(
             "_identify_vocatives called | text_length=%d | text_preview=%s",
             len(text) if text else 0,
             (text[:100] + "..." if text and len(text) > 100 else text) if text else None,
         )
         nlp = self._get_nlp()
         if not nlp:
-            self.logger.info("_identify_vocatives returning | result=[] (nlp not available)")
+            self.logger.debug("_identify_vocatives returning | result=[] (nlp not available)")
             return []
 
         doc = nlp(text)
@@ -410,7 +410,7 @@ class EpisodeVocativeDetector(LoggingBase):
 
         # Remove duplicates and return all candidates
         unique_vocatives = sorted(list(set(vocatives)))
-        self.logger.info(
+        self.logger.debug(
             "_identify_vocatives returning | result=%s | count=%d",
             unique_vocatives,
             len(unique_vocatives),
@@ -425,19 +425,19 @@ class EpisodeVocativeDetector(LoggingBase):
         on spaCy's sentence segmentation which can be incorrect.
         Returns the sentence text, or None if not found.
         """
-        self.logger.info(
+        self.logger.debug(
             "_extract_sentence_with_vocative called | text_length=%d | vocative=%s",
             len(text) if text else 0,
             vocative,
         )
         if not text or not text.strip() or not vocative:
-            self.logger.info("_extract_sentence_with_vocative returning | result=None (empty input)")
+            self.logger.debug("_extract_sentence_with_vocative returning | result=None (empty input)")
             return None
 
         # First, try to find the vocative in the text
         vocative_pos = text.find(vocative)
         if vocative_pos == -1:
-            self.logger.info("_extract_sentence_with_vocative returning | result=None (vocative not found in text)")
+            self.logger.debug("_extract_sentence_with_vocative returning | result=None (vocative not found in text)")
             return None
 
         # Find the start of the sentence by looking backwards for sentence-ending punctuation
@@ -507,7 +507,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         result = sent.text.strip()
                         break
 
-        self.logger.info(
+        self.logger.debug(
             "_extract_sentence_with_vocative returning | result=%s",
             result[:100] + "..." if len(result) > 100 else result,
         )
@@ -519,13 +519,13 @@ class EpisodeVocativeDetector(LoggingBase):
         Returns a list of character positions (start indices) where the name occurs.
         Uses word boundary matching to avoid matching substrings within words.
         """
-        self.logger.info(
+        self.logger.debug(
             "_find_all_occurrences called | text_length=%d | name=%s",
             len(text) if text else 0,
             name,
         )
         if not text or not name:
-            self.logger.info("_find_all_occurrences returning | result=[] (empty input)")
+            self.logger.debug("_find_all_occurrences returning | result=[] (empty input)")
             return []
 
         positions = []
@@ -555,7 +555,7 @@ class EpisodeVocativeDetector(LoggingBase):
             # Move search start past this occurrence
             search_start = pos + 1
 
-        self.logger.info(
+        self.logger.debug(
             "_find_all_occurrences returning | name=%s | positions=%s | count=%d",
             name,
             positions,
@@ -569,14 +569,14 @@ class EpisodeVocativeDetector(LoggingBase):
         Uses the same robust approach as _extract_sentence_with_vocative but with a known position.
         Returns the sentence text, or None if position is invalid.
         """
-        self.logger.info(
+        self.logger.debug(
             "_extract_sentence_with_vocative_at_position called | text_length=%d | vocative=%s | position=%d",
             len(text) if text else 0,
             vocative,
             position,
         )
         if not text or not text.strip() or not vocative or position < 0 or position >= len(text):
-            self.logger.info("_extract_sentence_with_vocative_at_position returning | result=None (invalid input)")
+            self.logger.debug("_extract_sentence_with_vocative_at_position returning | result=None (invalid input)")
             return None
 
         # Verify the vocative is actually at this position
@@ -660,7 +660,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         result = sent.text.strip()
                         break
 
-        self.logger.info(
+        self.logger.debug(
             "_extract_sentence_with_vocative_at_position returning | result=%s",
             result[:100] + "..." if len(result) > 100 else result,
         )
@@ -672,7 +672,7 @@ class EpisodeVocativeDetector(LoggingBase):
         Returns a dict with "classification" ("VOCATIVE" or "OTHER") and "justification" (explanation).
         Returns {"classification": "UNKNOWN", "justification": "<reason>"} if the LLM is unavailable or cannot return a valid response.
         """
-        self.logger.info(
+        self.logger.debug(
             "_classify_candidate_with_llm called | candidate=%s | sentence_length=%d",
             candidate,
             len(sentence) if sentence else 0,
@@ -699,7 +699,7 @@ class EpisodeVocativeDetector(LoggingBase):
 
         try:
             response = self.client.generate(prompt)
-            self.logger.info("_classify_candidate_with_llm LLM response | response=%s", response[:200])
+            self.logger.debug("_classify_candidate_with_llm LLM response | response=%s", response[:200])
             
             # Parse JSON response
             data = json.loads(response.strip())
@@ -711,7 +711,7 @@ class EpisodeVocativeDetector(LoggingBase):
                         "classification": classification.upper(),
                         "justification": str(justification).strip() if justification else ""
                     }
-                    self.logger.info(
+                    self.logger.debug(
                         "_classify_candidate_with_llm returning | classification=%s | justification=%s",
                         result["classification"],
                         result["justification"][:100] if result["justification"] else "",
@@ -731,7 +731,7 @@ class EpisodeVocativeDetector(LoggingBase):
         except requests.exceptions.RequestException as exc:
             # Handle HTTP errors (404, connection errors, etc.) gracefully
             # These are expected when Ollama is not running or endpoint is unavailable
-            self.logger.info(
+            self.logger.debug(
                 "_classify_candidate_with_llm returning | result=UNKNOWN (LLM service unavailable: %s)",
                 exc,
             )
@@ -747,18 +747,18 @@ class EpisodeVocativeDetector(LoggingBase):
 
     def _get_nlp(self) -> Optional[Any]:
         """Lazy-load the SpaCy model."""
-        self.logger.info(
+        self.logger.debug(
             "_get_nlp called | spacy_model=%s | nlp_loaded=%s",
             self.config.spacy_model,
             self._nlp is not None,
         )
         if self._nlp is not None:
-            self.logger.info("_get_nlp returning | result=<nlp_model> (cached)")
+            self.logger.debug("_get_nlp returning | result=<nlp_model> (cached)")
             return self._nlp
 
         try:
             self._nlp = spacy.load(self.config.spacy_model)
-            self.logger.info("_get_nlp returning | result=<nlp_model> (loaded)")
+            self.logger.debug("_get_nlp returning | result=<nlp_model> (loaded)")
             return self._nlp
         except OSError:
             self.logger.warning(
@@ -767,11 +767,11 @@ class EpisodeVocativeDetector(LoggingBase):
                 self.config.spacy_model,
             )
             self._nlp = None
-            self.logger.info("_get_nlp returning | result=None (OSError)")
+            self.logger.debug("_get_nlp returning | result=None (OSError)")
             return None
         except Exception as exc:
             self.logger.warning("Failed to load spaCy model: %s", exc, exc_info=exc)
             self._nlp = None
-            self.logger.info("_get_nlp returning | result=None (Exception)")
+            self.logger.debug("_get_nlp returning | result=None (Exception)")
             return None
 
