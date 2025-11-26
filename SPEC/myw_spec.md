@@ -175,6 +175,7 @@ The current implementation contains some hardcoded step name references in areas
 ## Conversational CLI (`mywconv.py`)
 
 - Minimal guided CLI that reuses the same services: load config, sync catalog, prompt for episode, then choose between scopes:
+  - Transcribe, diarize, and prettify only (default) - runs only transcription, diarization, and prettify steps
   - Full pipeline (from beginning)
   - Resume pipeline (only shown if the episode is not fully completed)
   - Partial pipeline (choose starting and ending steps)

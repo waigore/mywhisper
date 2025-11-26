@@ -117,23 +117,35 @@ def select_pipeline_scope(
 ) -> tuple[Optional[tuple[str, ...]], str]:
     completed = _completed_step_names(checkpoints, episode.episode_id)
     all_done = all(step in completed for step in STEP_ORDER)
-    options: dict[str, str] = {"1": "Full pipeline"}
+    options: dict[str, str] = {"1": "Transcribe, diarize, and prettify only", "2": "Full pipeline"}
     if not all_done:
-        options["2"] = "Resume pipeline"
-    options["3"] = "Partial pipeline"
+        options["3"] = "Resume pipeline"
+    options["4"] = "Partial pipeline"
 
     print("Pipeline scopes:\n")
     for key, label in options.items():
         print(f"  {key}. {label}")
     print()
 
-    default = "2" if "2" in options else "1"
+    default = "1"
     while True:
         selection = input(f"Select pipeline scope [{default}]: ").strip() or default
         label = options.get(selection)
         if not label:
             print("Invalid selection. Try again.", flush=True)
             continue
+
+        if label == "Transcribe, diarize, and prettify only":
+            plan = ("transcribe", "diarize", "prettify")
+            warning = _validate_scope_requirements(
+                episode_id=episode.episode_id,
+                plan=plan,
+                checkpoints=checkpoints,
+            )
+            if warning:
+                print(warning, flush=True)
+                continue
+            return tuple(plan), label
 
         if label == "Full pipeline":
             return None, label

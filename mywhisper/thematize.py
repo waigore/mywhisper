@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional, Sequence
 
-from .assign import LLMClient, OllamaClient
+from .llm_client import LLMClient, OllamaClient
 from .config import ensure_episode_subdir, resolve_data_root
 from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode

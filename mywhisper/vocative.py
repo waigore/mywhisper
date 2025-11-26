@@ -10,7 +10,7 @@ from typing import Any, Generator, List, Optional
 import requests
 import spacy
 
-from .assign import LLMClient, OllamaClient
+from .llm_client import LLMClient, OllamaClient
 from .config import ensure_episode_subdir, resolve_data_root
 from .logging_utils import LoggingBase
 from .models import PipelineEvent, PodcastEpisode
