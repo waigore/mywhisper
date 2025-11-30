@@ -10,11 +10,8 @@ from mywhisper.models import DiarizedTurn, TranscriptSegment
 from mywhisper.myw.config import MywConfig
 from mywhisper.myw.services.steps import (
     STEP_ORDER,
-    apply_diarization_labels,
-    ensure_diarized_turns,
     ensure_placeholder_assignment,
     load_artefact_path,
-    read_rttm_turns,
     read_transcript,
     validate_assignment_availability,
     validate_classified_availability,
@@ -23,6 +20,11 @@ from mywhisper.myw.services.steps import (
     validate_themes_availability,
     validate_transcript_availability,
     validate_vocative_availability,
+)
+from mywhisper.prettify import (
+    apply_diarization_labels,
+    ensure_diarized_turns,
+    read_rttm_turns,
 )
 
 
@@ -143,15 +145,208 @@ def test_apply_diarization_labels(tmp_path):
     ]
     
     labelled = apply_diarization_labels(segments, turns)
+    # With threshold filtering (0.3s default), the tiny 0.2s overlap on segment 2 is filtered
+    # So segment 2 gets assigned to SPK1 without splitting
     assert len(labelled) == 2
     assert labelled[0].speaker_id == "SPK0"
+    assert labelled[0].start == pytest.approx(0.0)
+    assert labelled[0].end == pytest.approx(1.0)
     assert labelled[1].speaker_id == "SPK1"
+    assert labelled[1].start == pytest.approx(1.0)
+    assert labelled[1].end == pytest.approx(2.0)
+    
+    # With lower threshold, should split segment 2
+    labelled_low_threshold = apply_diarization_labels(segments, turns, min_overlap_threshold=0.1)
+    assert len(labelled_low_threshold) == 3
+    assert labelled_low_threshold[0].speaker_id == "SPK0"
+    assert labelled_low_threshold[-1].speaker_id == "SPK1"
+    assert any(seg.speaker_id == "SPK0" and seg.start >= 1.0 for seg in labelled_low_threshold[1:])
+    assert any(seg.speaker_id == "SPK1" and seg.start >= 1.2 for seg in labelled_low_threshold)
     
     # Empty segments
     assert apply_diarization_labels([], turns) == []
     
     # Empty turns
     assert apply_diarization_labels(segments, []) == list(segments)
+
+
+def test_apply_diarization_labels_splits_overlapping_segment():
+    """Segments spanning multiple turns should split by diarization."""
+    segments = [
+        TranscriptSegment(start=0.0, end=2.0, text="hello world", speaker_id=None),
+    ]
+    turns = [
+        DiarizedTurn(start=0.0, end=1.0, speaker_id="SPK0"),
+        DiarizedTurn(start=1.0, end=2.0, speaker_id="SPK1"),
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    assert len(labelled) == 2
+    assert labelled[0].speaker_id == "SPK0"
+    assert labelled[1].speaker_id == "SPK1"
+    assert labelled[0].start == pytest.approx(0.0)
+    assert labelled[0].end == pytest.approx(1.0)
+    assert labelled[1].start == pytest.approx(1.0)
+    assert labelled[1].end == pytest.approx(2.0)
+    assert labelled[0].text
+    assert labelled[1].text
+
+
+def test_apply_diarization_labels_same_speaker_no_split():
+    """Segments with multiple overlaps from same speaker should not split."""
+    segments = [
+        TranscriptSegment(
+            start=161.54, 
+            end=168.32, 
+            text="Larry McDonald, welcome to Hidden Forces.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=98.868, end=161.694, speaker_id="SPEAKER_00"),
+        DiarizedTurn(start=164.950, end=168.578, speaker_id="SPEAKER_00"),
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    # Should not split since both overlaps are from same speaker
+    assert len(labelled) == 1
+    assert labelled[0].speaker_id == "SPEAKER_00"
+    assert labelled[0].start == pytest.approx(161.54)
+    assert labelled[0].end == pytest.approx(168.32)
+    assert labelled[0].text == "Larry McDonald, welcome to Hidden Forces."
+
+
+def test_apply_diarization_labels_filters_tiny_overlaps():
+    """Tiny overlaps below threshold should be filtered out."""
+    segments = [
+        TranscriptSegment(
+            start=168.32,
+            end=172.9,
+            text="It's great to be with you guys. I've heard a lot about the platform.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=168.32, end=168.578, speaker_id="SPEAKER_00"),  # 0.258s overlap
+        DiarizedTurn(start=169.203, end=173.489, speaker_id="SPEAKER_01"),  # ~3.7s overlap
+    ]
+    # With threshold of 0.5s, first overlap (0.258s) should be filtered
+    labelled = apply_diarization_labels(segments, turns, min_overlap_threshold=0.5)
+    # Should only have one overlap after filtering (SPEAKER_01)
+    assert len(labelled) == 1
+    assert labelled[0].speaker_id == "SPEAKER_01"
+    
+    # With lower threshold, should split
+    labelled_low_threshold = apply_diarization_labels(segments, turns, min_overlap_threshold=0.1)
+    assert len(labelled_low_threshold) >= 2
+
+
+def test_apply_diarization_labels_boundary_aware_splitting():
+    """Text should be split at sentence boundaries when possible."""
+    segments = [
+        TranscriptSegment(
+            start=0.0,
+            end=10.0,
+            text="Hello world. This is a test. Another sentence here.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=0.0, end=5.0, speaker_id="SPK0"),
+        DiarizedTurn(start=5.0, end=10.0, speaker_id="SPK1"),
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    # With sentence-based assignment, should split into 3 segments (one per sentence)
+    assert len(labelled) == 3
+    assert labelled[0].speaker_id == "SPK0"
+    assert "Hello world" in labelled[0].text
+    assert labelled[0].text.endswith(".")
+    # Second sentence should be assigned based on overlap
+    assert labelled[1].text.endswith(".")
+    # Third sentence should be assigned to SPK1
+    assert labelled[2].speaker_id == "SPK1"
+    assert "Another sentence here" in labelled[2].text
+    assert labelled[2].text.endswith(".")
+
+
+def test_apply_diarization_labels_sentence_based_assignment():
+    """Multiple sentences should be assigned to speakers without splitting sentences."""
+    segments = [
+        TranscriptSegment(
+            start=0.0,
+            end=10.0,
+            text="First sentence here. Second sentence here. Third sentence here.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=0.0, end=3.5, speaker_id="SPK0"),  # Overlaps with first sentence
+        DiarizedTurn(start=3.5, end=6.5, speaker_id="SPK1"),  # Overlaps with second sentence
+        DiarizedTurn(start=6.5, end=10.0, speaker_id="SPK2"),  # Overlaps with third sentence
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    # Should have 3 segments, one per sentence
+    assert len(labelled) == 3
+    assert labelled[0].speaker_id == "SPK0"
+    assert "First sentence here" in labelled[0].text
+    assert labelled[1].speaker_id == "SPK1"
+    assert "Second sentence here" in labelled[1].text
+    assert labelled[2].speaker_id == "SPK2"
+    assert "Third sentence here" in labelled[2].text
+    # Verify sentences are complete (not split)
+    assert labelled[0].text.endswith(".")
+    assert labelled[1].text.endswith(".")
+    assert labelled[2].text.endswith(".")
+
+
+def test_apply_diarization_labels_percentage_based_selection():
+    """When multiple speakers overlap same sentence, assign based on percentage overlap."""
+    segments = [
+        TranscriptSegment(
+            start=0.0,
+            end=5.0,
+            text="This is a single sentence that overlaps with multiple speakers.",
+            speaker_id=None
+        ),
+    ]
+    # Both speakers overlap 1.5s with the sentence
+    # SPK0 has a 10s turn, SPK1 has a 1.8s turn
+    # SPK0 percentage: 1.5/10 = 0.15 (15%)
+    # SPK1 percentage: 1.5/1.8 = 0.833 (83.3%)
+    # Should assign to SPK1 (higher percentage)
+    turns = [
+        DiarizedTurn(start=0.0, end=10.0, speaker_id="SPK0"),  # 10s turn, overlaps 1.5s
+        DiarizedTurn(start=1.0, end=2.8, speaker_id="SPK1"),  # 1.8s turn, overlaps 1.5s
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    # Should assign entire sentence to SPK1 (higher percentage)
+    assert len(labelled) == 1
+    assert labelled[0].speaker_id == "SPK1"
+    assert labelled[0].text == "This is a single sentence that overlaps with multiple speakers."
+
+
+def test_apply_diarization_labels_sentences_never_split():
+    """Sentences should never be split across multiple speakers."""
+    segments = [
+        TranscriptSegment(
+            start=0.0,
+            end=10.0,
+            text="First sentence. Second sentence. Third sentence.",
+            speaker_id=None
+        ),
+    ]
+    # Overlapping turns that would cause proportional splitting
+    turns = [
+        DiarizedTurn(start=0.0, end=3.5, speaker_id="SPK0"),
+        DiarizedTurn(start=2.0, end=6.5, speaker_id="SPK1"),
+        DiarizedTurn(start=5.0, end=10.0, speaker_id="SPK2"),
+    ]
+    labelled = apply_diarization_labels(segments, turns)
+    # Each sentence should be assigned to one speaker (not split)
+    assert len(labelled) == 3
+    # Verify each segment is a complete sentence
+    for seg in labelled:
+        assert seg.text.endswith(".")
+        # Verify sentence is not split (should contain complete sentence text)
+        assert "sentence" in seg.text.lower()
 
 
 def test_ensure_placeholder_assignment(tmp_path):

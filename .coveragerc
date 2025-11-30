@@ -8,4 +8,6 @@ omit =
     mywhisper/myw/models.py
     mywhisper/myw/app.py
     mywhisper/myw/myw.py
+    mywhisper/myw/widgets/*
+    mywhisper/myw/screens/*
 

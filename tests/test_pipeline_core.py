@@ -16,7 +16,6 @@ from mywhisper.myw.services.pipeline import (
     STEP_ORDER,
 )
 from mywhisper.myw.services.steps import (
-    ensure_diarized_turns,
     load_step_path,
     read_transcript,
     validate_assignment_availability,
@@ -25,6 +24,7 @@ from mywhisper.myw.services.steps import (
     validate_themes_availability,
     validate_transcript_availability,
 )
+from mywhisper.prettify import ensure_diarized_turns
 
 
 class DummyQueue:

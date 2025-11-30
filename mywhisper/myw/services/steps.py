@@ -11,10 +11,18 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from ...assign import AssignmentConfig, TranscriptAssigner
 from ...checkpoints import CheckpointStore, PipelineCheckpoint
 from ...classify import ClassifyConfig, EpisodeClassifier
-from ...diarize import DiarizationConfig, DiarizationPipeline
+from ...diarize import (
+    DiarizationConfig,
+    DiarizationPipeline,
+)
 from ...models import DiarizedTurn, PipelineEvent, PodcastEpisode, TranscriptSegment
 from ...podcasts import PodcastCatalog
-from ...prettify import PrettifyConfig, TranscriptPrettifier
+from ...prettify import (
+    PrettifyConfig,
+    TranscriptPrettifier,
+    apply_diarization_labels,
+    ensure_diarized_turns,
+)
 from ...thematize import ThematizeConfig, EpisodeThematizer
 from ...transcribe import PodcastTranscriber, TranscriptionConfig
 from ...vocative import EpisodeVocativeDetector, VocativeConfig
@@ -569,127 +577,6 @@ def read_transcript(path: Path) -> Optional[Sequence[TranscriptSegment]]:
     return segments
 
 
-def ensure_diarized_turns(diarization_results: Any) -> List[DiarizedTurn]:
-    """Convert diarization results to a list of DiarizedTurn objects."""
-    if diarization_results is None:
-        return []
-
-    if isinstance(diarization_results, list):
-        turns: List[DiarizedTurn] = []
-        for item in diarization_results:
-            if isinstance(item, DiarizedTurn):
-                turns.append(item)
-            elif isinstance(item, dict):
-                try:
-                    start = float(item["start"])
-                    end = float(item["end"])
-                    speaker = str(item.get("speaker") or item.get("speaker_id") or "")
-                except (KeyError, TypeError, ValueError):
-                    continue
-                turns.append(DiarizedTurn(start=start, end=end, speaker_id=speaker or "UNKNOWN"))
-        turns.sort(key=lambda turn: (turn.start, turn.end))
-        return turns
-
-    if isinstance(diarization_results, (str, Path)):
-        return read_rttm_turns(Path(diarization_results))
-
-    return []
-
-
-def read_rttm_turns(path: Path) -> List[DiarizedTurn]:
-    """Read diarization turns from an RTTM file."""
-    if not path.exists():
-        LOGGER.warning("RTTM file %s not found; cannot load diarization turns.", path)
-        return []
-
-    turns: List[DiarizedTurn] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 8 or parts[0].upper() != "SPEAKER":
-                continue
-            try:
-                start = float(parts[3])
-                duration = float(parts[4])
-            except ValueError:
-                continue
-            speaker = parts[7] if len(parts) > 7 else ""
-            turns.append(
-                DiarizedTurn(
-                    start=start,
-                    end=start + duration,
-                    speaker_id=str(speaker or f"speaker_{len(turns)}"),
-                )
-            )
-    turns.sort(key=lambda turn: (turn.start, turn.end))
-    return turns
-
-
-def apply_diarization_labels(
-    segments: Sequence[TranscriptSegment],
-    turns: Sequence[DiarizedTurn],
-) -> List[TranscriptSegment]:
-    """Apply diarization speaker IDs to transcript segments based on time overlap."""
-    if not segments:
-        return []
-    if not turns:
-        return list(segments)
-
-    sorted_turns = sorted(turns, key=lambda turn: (turn.start, turn.end))
-    updated_segments: List[TranscriptSegment] = []
-    leading_index = 0
-    total_turns = len(sorted_turns)
-
-    for seg in segments:
-        if seg.speaker_id:
-            updated_segments.append(seg)
-            continue
-
-        start = seg.start
-        end = seg.end
-        best_id: Optional[str] = None
-        best_overlap = 0.0
-
-        idx = leading_index
-        while idx < total_turns and sorted_turns[idx].end <= start:
-            idx += 1
-        leading_index = idx
-
-        scan = idx
-        while scan < total_turns:
-            turn = sorted_turns[scan]
-            if turn.start >= end:
-                break
-            overlap_start = max(start, turn.start)
-            overlap_end = min(end, turn.end)
-            if overlap_end > overlap_start:
-                overlap = overlap_end - overlap_start
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_id = turn.speaker_id
-            scan += 1
-
-        if best_id:
-            updated_segments.append(
-                TranscriptSegment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text,
-                    speaker_id=best_id,
-                    speaker_name=seg.speaker_name,
-                    confidence=seg.confidence,
-                    justification=seg.justification,
-                    metadata=dict(seg.metadata),
-                )
-            )
-        else:
-            updated_segments.append(seg)
-
-    return updated_segments
-
 
 def ensure_placeholder_assignment(
     config: MywConfig,
@@ -1201,18 +1088,6 @@ class DiarizeStep(Step):
         """Validate that diarization can run."""
         diarization_results = dependencies.get("diarization_results")
         validate_diarization_availability(plan, completed_steps, diarization_results)
-
-    def ensure_diarized_turns(self, diarization_results: Any) -> List[DiarizedTurn]:
-        """Convert diarization results to a list of DiarizedTurn objects."""
-        # Reference the function defined in this module
-        return ensure_diarized_turns(diarization_results)
-
-    def apply_diarization_labels(
-        self, segments: Sequence[TranscriptSegment], turns: Sequence[DiarizedTurn]
-    ) -> List[TranscriptSegment]:
-        """Apply diarization speaker IDs to transcript segments based on time overlap."""
-        # Reference the function defined in this module
-        return apply_diarization_labels(segments, turns)
 
     def __init__(self, myw_config: MywConfig) -> None:
         self._myw_config = myw_config
