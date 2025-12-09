@@ -235,6 +235,19 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
         def run(self):
             return [DiarizedTurn(start=0.0, end=1.0, speaker_id="S0")]
 
+    # Create RTTM file for prettify step (it requires diarization results)
+    # The path should match what DiarizationConfig.artefact_paths() returns
+    # data_dir is tmp_path, so RTTM goes to tmp_path / "transcripts" / episode_key / "{episode_key}.rttm"
+    from mywhisper.diarize import DiarizationConfig
+    diarize_config = DiarizationConfig(data_root=tmp_path)
+    rttm_path = diarize_config.artefact_paths(episode, episode.episode_key)["rttm_path"]
+    rttm_path.parent.mkdir(parents=True, exist_ok=True)
+    rttm_path.write_text(
+        "SPEAKER test 1 0.0 1.0 <NA> <NA> S0 <NA> <NA>\n"
+        "SPEAKER test 1 1.0 1.0 <NA> <NA> S1 <NA> <NA>\n",
+        encoding="utf-8",
+    )
+
     assignment_path = tmp_path / "assigned.json"
     assignment_path.parent.mkdir(parents=True, exist_ok=True)
     assignment_path.write_text("[]")
@@ -283,7 +296,7 @@ def test_pipeline_process_episode_runs_full_plan(monkeypatch, tmp_path):
                 self._last_readable_path = readable_path
                 self._last_condensed_path = condensed_path
 
-            def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
+            def prettify(self, assignment_path: Path | None = None, diarization_results=None, yield_progress: bool = True):
                 def generator():
                     yield PipelineEvent(
                         stage="prettify",
@@ -406,7 +419,10 @@ def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path)
     transcript_path.write_text(json.dumps(transcript_payload))
 
     rttm_path = tmp_path / "cached.rttm"
-    rttm_path.write_text("dummy")
+    rttm_path.write_text(
+        "SPEAKER test 1 0.0 1.0 <NA> <NA> S0 <NA> <NA>\n",
+        encoding="utf-8",
+    )
 
     episode = PodcastEpisode(
         episode_id="ep-cache",
@@ -463,7 +479,7 @@ def test_pipeline_process_episode_uses_cached_checkpoints(monkeypatch, tmp_path)
     class StubPrettifier:
         def __init__(self, *args, **kwargs):
             pass
-        def prettify(self, assignment_path: Path | None = None, yield_progress: bool = True):
+        def prettify(self, assignment_path: Path | None = None, diarization_results=None, yield_progress: bool = True):
             def generator():
                 rp = Path(str(assignment_path).replace("_with_names.json", "_readable.txt"))
                 rp.parent.mkdir(parents=True, exist_ok=True)

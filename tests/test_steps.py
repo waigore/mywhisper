@@ -239,6 +239,48 @@ def test_apply_diarization_labels_filters_tiny_overlaps():
     assert len(labelled_low_threshold) >= 2
 
 
+def test_apply_diarization_labels_assigns_indeterminate_when_all_below_threshold():
+    """When all overlaps are below threshold, assign largest overlap with indeterminate=True."""
+    segments = [
+        TranscriptSegment(
+            start=1850.0,
+            end=1850.82,
+            text="All right.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=1768.143, end=1850.189, speaker_id="SPEAKER_01"),  # 0.189s overlap
+        DiarizedTurn(start=1850.662, end=1853.497, speaker_id="SPEAKER_02"),  # 0.158s overlap
+    ]
+    # Both overlaps are below default threshold of 0.3s
+    labelled = apply_diarization_labels(segments, turns, min_overlap_threshold=0.3)
+    assert len(labelled) == 1
+    # Should assign SPEAKER_01 (largest overlap: 0.189s > 0.158s)
+    assert labelled[0].speaker_id == "SPEAKER_01"
+    assert labelled[0].indeterminate is True
+    assert labelled[0].text == "All right."
+
+
+def test_apply_diarization_labels_no_indeterminate_when_above_threshold():
+    """Normal assignments above threshold should not have indeterminate field."""
+    segments = [
+        TranscriptSegment(
+            start=0.0,
+            end=2.0,
+            text="Hello world.",
+            speaker_id=None
+        ),
+    ]
+    turns = [
+        DiarizedTurn(start=0.0, end=2.5, speaker_id="SPEAKER_00"),  # 2.0s overlap, above threshold
+    ]
+    labelled = apply_diarization_labels(segments, turns, min_overlap_threshold=0.3)
+    assert len(labelled) == 1
+    assert labelled[0].speaker_id == "SPEAKER_00"
+    assert labelled[0].indeterminate is None  # Should not be set for normal assignments
+
+
 def test_apply_diarization_labels_boundary_aware_splitting():
     """Text should be split at sentence boundaries when possible."""
     segments = [

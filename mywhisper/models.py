@@ -93,6 +93,7 @@ class TranscriptSegment:
     speaker_name: Optional[str] = None
     confidence: Optional[float] = None
     justification: Optional[str] = None
+    indeterminate: Optional[bool] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def duration(self) -> float:

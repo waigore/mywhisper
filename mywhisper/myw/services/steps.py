@@ -1116,7 +1116,12 @@ class PrettifyStep(Step):
         assignment_path = kwargs.get("assignment_path")
         if assignment_path is None:
             raise ValueError("assignment_path is required for PrettifyStep.execute")
-        return executor.prettify(assignment_path=assignment_path, yield_progress=True)
+        diarization_results = kwargs.get("diarization_results")
+        return executor.prettify(
+            assignment_path=assignment_path,
+            diarization_results=diarization_results,
+            yield_progress=True,
+        )
 
     def ensure_placeholder_assignment(
         self, episode: PodcastEpisode, segments: Sequence[TranscriptSegment]
@@ -1157,9 +1162,10 @@ class PrettifyStep(Step):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Prepare inputs for prettify: apply diarization labels and create placeholder assignment.
+        Prepare inputs for prettify: create placeholder assignment from raw segments.
         
-        Requires episode from context.
+        Requires episode from context. Diarization labels will be applied during
+        prettify execution after sentence merging.
         """
         episode = getattr(context, "episode", None)
         if episode is None:
@@ -1171,21 +1177,30 @@ class PrettifyStep(Step):
         
         diarization_results = dependencies.get("diarization_results")
         
-        # Apply diarization labels if available
-        if diarization_results:
-            diarized_turns = ensure_diarized_turns(diarization_results)
-            if diarized_turns:
-                transcript_segments = apply_diarization_labels(transcript_segments, diarized_turns)
-            else:
-                LOGGER.warning(
-                    "No diarization turns available for %s; speaker IDs will remain unset.",
-                    episode.episode_id,
+        # Validate that diarization results are available
+        if diarization_results is None:
+            raise RuntimeError(
+                f"Diarization results are required for prettify step. "
+                f"Episode {episode.episode_id} has no diarization results. "
+                f"Run diarize step first or include it in the pipeline plan."
+            )
+        
+        # If diarization_results is a Path, verify it exists
+        if isinstance(diarization_results, Path):
+            if not diarization_results.exists():
+                raise FileNotFoundError(
+                    f"Diarization RTTM file not found: {diarization_results}. "
+                    f"Episode {episode.episode_id} requires diarization results. "
+                    f"Run diarize step first or include it in the pipeline plan."
                 )
         
-        # Create placeholder assignment
+        # Create placeholder assignment from raw segments (without diarization labels)
         assignment_path = self.ensure_placeholder_assignment(episode, transcript_segments or [])
         
-        return {"assignment_path": assignment_path}
+        return {
+            "assignment_path": assignment_path,
+            "diarization_results": diarization_results,
+        }
 
     def load_artefact(self, checkpoints: CheckpointStore, episode_id: str) -> Optional[Any]:
         """Load readable path from checkpoint. Returns a dict with readable_path and condensed_path."""

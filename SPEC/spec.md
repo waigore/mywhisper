@@ -55,9 +55,15 @@
 
 ### Prettify Step
 - Module: `mywhisper/prettify.py` exporting `PrettifyConfig` + `TranscriptPrettifier`.
-- Collapse contiguous segments (speaker match, ≤`collapse_gap_seconds` pause, `max_block_characters` guard), format using placeholder speaker identifiers from diarization (e.g., `SPEAKER_0: <text>`), and write two artefacts:
+- Process transcript segments through four stages:
+  1. **Load segments**: Load transcript segments from assignment file (raw segments without diarization labels).
+  2. **Sentence-boundary merging**: Merge consecutive segments that belong to the same sentence (segments that don't end with sentence-ending punctuation `.`, `!`, `?` are merged with following segments until a sentence boundary is found). This merging is text-based only and does not depend on speaker assignments. A failsafe prevents merging when the combined text exceeds 40 words without any punctuation (comma `,`, semicolon `;`, full stop `.`, question mark `?`, exclamation `!`). If the combined word stream exceeds 40 words without punctuation, segments are left as-is. Segments are only merged if they are contiguous (gaps ≤`collapse_gap_seconds`).
+  3. **Apply diarization labels**: Apply speaker IDs from diarization results to the merged segments based on time overlap. This happens after sentence merging so that diarization labels are applied to complete sentences rather than partial segments. When all speaker overlaps are below the `min_overlap_threshold` (default 0.3s), the speaker with the largest overlap is assigned and the segment is marked with `indeterminate: true` to indicate uncertain assignment.
+  4. **Collapse contiguous segments**: Merge segments with matching speakers, gaps ≤`collapse_gap_seconds`, and within `max_block_characters` limit.
+  5. **Split large blocks**: Split blocks that exceed 10 sentences into smaller blocks.
+- Format using placeholder speaker identifiers from diarization (e.g., `SPEAKER_0: <text>`), and write two artefacts:
   - `{episode_key}_readable.txt` (human-readable transcript)
-  - `{episode_key}_condensed.json` (JSON array of collapsed blocks with fields `start,end,speaker_id,speaker_name,text`)
+  - `{episode_key}_condensed.json` (JSON array of collapsed blocks with fields `start,end,speaker_id,speaker_name,text`, and optionally `indeterminate` when speaker assignment is uncertain)
 - Register artefact kinds `readable_transcript` and `condensed_transcript` via `PodcastCatalog.record_artefact(...)` and emit generator-driven `PipelineEvent(stage="prettify", step_name="prettify")` for load/collapse/persist.
 - Config knobs: `data_root`, `collapse_gap_seconds` (default 1.5 s), optional `max_block_characters`, output subdir override.
 

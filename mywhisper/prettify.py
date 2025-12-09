@@ -80,9 +80,10 @@ class TranscriptPrettifier(LoggingBase):
         self,
         *,
         assignment_path: Optional[Path] = None,
+        diarization_results: Optional[Any] = None,
         yield_progress: bool = False,
     ) -> Dict[str, Path] | Generator[PipelineEvent, None, Dict[str, Path]]:
-        pipeline = self._pipeline(assignment_path=assignment_path)
+        pipeline = self._pipeline(assignment_path=assignment_path, diarization_results=diarization_results)
         if yield_progress:
             return pipeline
 
@@ -99,6 +100,7 @@ class TranscriptPrettifier(LoggingBase):
     def _pipeline(
         self,
         assignment_path: Optional[Path],
+        diarization_results: Optional[Any] = None,
     ) -> Generator[PipelineEvent, None, Dict[str, Path]]:
         episode_key = self.podcast.episode_key
         resolved_assignment = assignment_path or self.config.assignment_path(self.podcast, episode_key)
@@ -137,6 +139,53 @@ class TranscriptPrettifier(LoggingBase):
         )
 
         segments = self._load_segments(resolved_assignment)
+        segments = self._merge_segments_by_sentences(segments)
+        
+        # Apply diarization labels after sentence merging
+        # Diarization results are required for prettify step
+        if diarization_results is None:
+            raise RuntimeError(
+                f"Diarization results are required for prettify step. "
+                f"Episode {self.podcast.episode_id} has no diarization results. "
+                f"Run diarize step first or include it in the pipeline plan."
+            )
+        
+        # If diarization_results is a Path, verify it exists
+        if isinstance(diarization_results, Path):
+            if not diarization_results.exists():
+                raise FileNotFoundError(
+                    f"Diarization RTTM file not found: {diarization_results}. "
+                    f"Episode {self.podcast.episode_id} requires diarization results. "
+                    f"Run diarize step first or include it in the pipeline plan."
+                )
+        
+        self.logger.debug(
+            "Applying diarization labels | episode=%s | diarization_results=%s",
+            self.podcast.episode_id,
+            diarization_results,
+        )
+        diarized_turns = ensure_diarized_turns(diarization_results)
+        self.logger.debug(
+            "Loaded diarized turns | episode=%s | turns_count=%d",
+            self.podcast.episode_id,
+            len(diarized_turns) if diarized_turns else 0,
+        )
+        
+        if not diarized_turns:
+            raise RuntimeError(
+                f"No diarization turns found in {diarization_results}. "
+                f"Episode {self.podcast.episode_id} requires valid diarization results. "
+                f"The RTTM file may be empty or malformed. Run diarize step again."
+            )
+        
+        segments = apply_diarization_labels(segments, diarized_turns)
+        self.logger.info(
+            "Applied diarization labels | episode=%s | segments_count=%d | turns_count=%d",
+            self.podcast.episode_id,
+            len(segments) if segments else 0,
+            len(diarized_turns),
+        )
+        
         blocks = self._collapse_segments(segments)
         
         # Split blocks that exceed 10 sentences
@@ -161,17 +210,21 @@ class TranscriptPrettifier(LoggingBase):
         )
 
         # Persist condensed JSON (collapsed blocks)
-        condensed_records = [
-            {
+        condensed_records = []
+        for block in blocks:
+            if not block.get("texts"):
+                continue
+            record = {
                 "start": float(block.get("start", 0.0)),
                 "end": float(block.get("end", 0.0)),
                 "speaker_id": block.get("speaker_id") or "UNKNOWN",
                 "speaker_name": block.get("speaker_name") or (block.get("speaker_id") or "UNKNOWN"),
                 "text": " ".join(part.strip() for part in (block.get("texts") or []) if str(part).strip()),
             }
-            for block in blocks
-            if block.get("texts")
-        ]
+            # Only include indeterminate field when True
+            if block.get("indeterminate") is True:
+                record["indeterminate"] = True
+            condensed_records.append(record)
         condensed_path.parent.mkdir(parents=True, exist_ok=True)
         condensed_path.write_text(json.dumps(condensed_records, ensure_ascii=False, indent=2), encoding="utf-8")
         self.logger.info(
@@ -250,6 +303,7 @@ class TranscriptPrettifier(LoggingBase):
 
             speaker_id = str(record.get("speaker_id") or record.get("speaker") or "UNKNOWN").strip()
             speaker_name = str(record.get("speaker_name") or speaker_id or "UNKNOWN").strip()
+            indeterminate = record.get("indeterminate") if record.get("indeterminate") is True else None
             segments.append(
                 TranscriptSegment(
                     start=start,
@@ -259,11 +313,184 @@ class TranscriptPrettifier(LoggingBase):
                     speaker_name=speaker_name or speaker_id or "UNKNOWN",
                     confidence=record.get("confidence"),
                     justification=record.get("justification"),
+                    indeterminate=indeterminate,
                     metadata=record.get("metadata", {}),
                 )
             )
         segments.sort(key=lambda seg: (seg.start, seg.end))
         return segments
+
+    def _should_prevent_merge_by_failsafe(self, merge_group: List[TranscriptSegment]) -> bool:
+        """
+        Check if merging should be prevented by the 40-word failsafe rule.
+        
+        Args:
+            merge_group: List of segments to potentially merge
+            
+        Returns:
+            True if merging should be prevented, False otherwise
+        """
+        if len(merge_group) <= 1:
+            return False
+        
+        combined_text = " ".join(seg.text.strip() for seg in merge_group)
+        words = combined_text.split()
+        word_count = len([w for w in words if w.strip()])
+        
+        if word_count <= 40:
+            return False
+        
+        punctuation_pattern = re.compile(r"[,;.!?]")
+        has_punctuation = bool(punctuation_pattern.search(combined_text))
+        
+        return not has_punctuation
+
+    def _process_merge_group(
+        self,
+        merge_group: List[TranscriptSegment],
+        first_seg: TranscriptSegment,
+        merged: List[TranscriptSegment],
+    ) -> None:
+        """
+        Process a merge group by either merging segments or adding them individually.
+        
+        Args:
+            merge_group: List of segments to process
+            first_seg: First segment in the group (for metadata)
+            merged: List to append results to
+        """
+        if len(merge_group) == 1:
+            # Only one segment, just add it
+            merged.append(first_seg)
+            return
+        
+        if self._should_prevent_merge_by_failsafe(merge_group):
+            # Don't merge, add segments individually
+            merged.extend(merge_group)
+            return
+        
+        # Merge the segments
+        merged_seg = self._create_merged_segment(merge_group, first_seg)
+        merged.append(merged_seg)
+
+    def _create_merged_segment(
+        self, merge_group: List[TranscriptSegment], first_seg: TranscriptSegment
+    ) -> TranscriptSegment:
+        """
+        Create a merged segment from a group of segments.
+        
+        Args:
+            merge_group: List of segments to merge
+            first_seg: First segment in the group (for metadata)
+            
+        Returns:
+            Merged TranscriptSegment
+        """
+        merged_text = " ".join(seg.text.strip() for seg in merge_group)
+        return TranscriptSegment(
+            start=min(seg.start for seg in merge_group),
+            end=max(seg.end for seg in merge_group),
+            text=merged_text,
+            speaker_id=first_seg.speaker_id,
+            speaker_name=first_seg.speaker_name,
+            confidence=first_seg.confidence,
+            justification=first_seg.justification,
+            metadata=dict(first_seg.metadata),
+        )
+
+    def _merge_segments_by_sentences(self, segments: Sequence[TranscriptSegment]) -> List[TranscriptSegment]:
+        """
+        Merge consecutive segments that belong to the same sentence.
+        
+        Segments that don't end with sentence-ending punctuation (., !, ?) are merged
+        with following segments until a sentence boundary is found. A failsafe prevents
+        merging when the combined text exceeds 40 words without any punctuation.
+        
+        This function only depends on segment text content and timing gaps, not on
+        speaker assignments. Speaker labels are applied after merging.
+        
+        Args:
+            segments: List of transcript segments to merge
+            
+        Returns:
+            List of merged transcript segments
+        """
+        if not segments:
+            return []
+        
+        merged: List[TranscriptSegment] = []
+        i = 0
+        sentence_end_pattern = re.compile(r"[.!?]\s*$")
+        
+        while i < len(segments):
+            current_seg = segments[i]
+            merge_group = [current_seg]
+            
+            # Check if current segment ends with sentence-ending punctuation
+            if sentence_end_pattern.search(current_seg.text):
+                # Segment is complete, no merging needed
+                merged.append(current_seg)
+                i += 1
+                continue
+            
+            # Collect following segments until we find a sentence boundary
+            # Only merge segments that are contiguous (no gap or minimal gap)
+            j = i + 1
+            found_boundary = False
+            max_gap_seconds = self.config.collapse_gap_seconds or 1.5  # Use collapse gap or default 1.5s
+            broke_due_to_constraint = False
+            
+            while j < len(segments):
+                next_seg = segments[j]
+                
+                # Check constraints: don't merge across large gaps
+                prev_seg = merge_group[-1]
+                gap = max(0.0, next_seg.start - prev_seg.end)
+                
+                # Check if gap is too large - segments must be contiguous
+                if gap > max_gap_seconds:
+                    # Gap too large, stop collecting
+                    broke_due_to_constraint = True
+                    break
+                
+                merge_group.append(next_seg)
+                
+                # Check if this segment ends with sentence-ending punctuation
+                if not sentence_end_pattern.search(next_seg.text):
+                    # No sentence boundary yet, continue collecting
+                    j += 1
+                    continue
+                
+                # Found sentence boundary, check failsafe before merging
+                found_boundary = True
+                if self._should_prevent_merge_by_failsafe(merge_group):
+                    # Don't merge, add segments individually
+                    merged.extend(merge_group[:-1])  # Add all except the last
+                    i = j  # Move to the last segment, which will be processed in next iteration
+                    break
+                
+                # Merge the segments
+                merged_seg = self._create_merged_segment(merge_group, current_seg)
+                merged.append(merged_seg)
+                i = j + 1
+                break
+            
+            # If we handled a boundary case (merged or failsafe), continue to next iteration
+            if found_boundary:
+                continue
+            
+            # If we broke due to gap constraint, handle the merge_group we collected
+            if broke_due_to_constraint:
+                self._process_merge_group(merge_group, current_seg, merged)
+                i = j  # Continue from the segment that caused the break
+                continue
+            
+            # If we reached the end without finding a sentence boundary
+            if j >= len(segments):
+                self._process_merge_group(merge_group, current_seg, merged)
+                break
+        
+        return merged
 
     def _collapse_segments(self, segments: Sequence[TranscriptSegment]) -> List[dict]:
         blocks: List[dict] = []
@@ -281,6 +508,9 @@ class TranscriptPrettifier(LoggingBase):
                 current["texts"].append(text)
                 current["end"] = seg.end
                 current["char_count"] += len(text) + (1 if previous_count else 0)
+                # Preserve indeterminate if any segment in the block has it
+                if seg.indeterminate is True:
+                    current["indeterminate"] = True
             else:
                 if current:
                     blocks.append(current)
@@ -292,6 +522,9 @@ class TranscriptPrettifier(LoggingBase):
                     "end": seg.end,
                     "char_count": len(text),
                 }
+                # Include indeterminate if segment has it set to True
+                if seg.indeterminate is True:
+                    current["indeterminate"] = True
 
         if current:
             blocks.append(current)
@@ -300,6 +533,12 @@ class TranscriptPrettifier(LoggingBase):
     def _can_merge(self, current: dict, segment: TranscriptSegment, text: str) -> bool:
         segment_id = (segment.speaker_id or "UNKNOWN").strip() or "UNKNOWN"
         if not current["speaker_id"] or current["speaker_id"] != segment_id:
+            return False
+
+        # Do not merge if indeterminate status differs
+        current_indeterminate = current.get("indeterminate") is True
+        segment_indeterminate = segment.indeterminate is True
+        if current_indeterminate != segment_indeterminate:
             return False
 
         gap_limit = self.config.collapse_gap_seconds
@@ -488,7 +727,11 @@ def ensure_diarized_turns(diarization_results: Any) -> List[DiarizedTurn]:
         turns.sort(key=lambda turn: (turn.start, turn.end))
         return turns
 
-    if isinstance(diarization_results, (str, Path)):
+    # Handle Path objects and strings
+    if isinstance(diarization_results, Path):
+        return read_rttm_turns(diarization_results)
+    
+    if isinstance(diarization_results, str):
         return read_rttm_turns(Path(diarization_results))
 
     return []
@@ -824,13 +1067,14 @@ def _assign_sentences_to_speakers(
             key=lambda item: float(item.get("percentage", 0.0)),
         )
         
+        speaker_id = str(best_overlap.get("speaker_id") or "UNKNOWN")
         result_segments.append(
             TranscriptSegment(
                 start=sentence_start,
                 end=sentence_end,
                 text=sentence_text,
-                speaker_id=str(best_overlap.get("speaker_id") or "UNKNOWN"),
-                speaker_name=segment.speaker_name,
+                speaker_id=speaker_id,
+                speaker_name=_get_speaker_name(speaker_id, segment.speaker_name),
                 confidence=segment.confidence,
                 justification=segment.justification,
                 metadata=dict(segment.metadata),
@@ -864,13 +1108,14 @@ def _split_segment_by_parts(
     results: List[TranscriptSegment] = []
     for idx, part in enumerate(filtered_parts):
         text_piece = text_parts[idx] if idx < len(text_parts) else ""
+        speaker_id = str(part.get("speaker_id") or "UNKNOWN")
         results.append(
             TranscriptSegment(
                 start=float(part["start"]),
                 end=float(part["end"]),
                 text=text_piece,
-                speaker_id=str(part.get("speaker_id") or "UNKNOWN"),
-                speaker_name=segment.speaker_name,
+                speaker_id=speaker_id,
+                speaker_name=_get_speaker_name(speaker_id, segment.speaker_name),
                 confidence=segment.confidence,
                 justification=segment.justification,
                 metadata=dict(segment.metadata),
@@ -878,6 +1123,13 @@ def _split_segment_by_parts(
         )
 
     return results
+
+
+def _get_speaker_name(speaker_id: str, original_speaker_name: Optional[str]) -> str:
+    """Get speaker_name from speaker_id, falling back to original if speaker_id is UNKNOWN."""
+    if not speaker_id or speaker_id.strip().upper() == "UNKNOWN":
+        return original_speaker_name or "UNKNOWN"
+    return speaker_id
 
 
 def apply_diarization_labels(
@@ -903,7 +1155,9 @@ def apply_diarization_labels(
     total_turns = len(sorted_turns)
 
     for seg in segments:
-        if seg.speaker_id:
+        # Only skip if speaker_id is already assigned and not UNKNOWN
+        # Process segments with None, empty string, or "UNKNOWN" speaker_id
+        if seg.speaker_id and seg.speaker_id.strip() and seg.speaker_id.strip().upper() != "UNKNOWN":
             updated_segments.append(seg)
             continue
 
@@ -922,7 +1176,28 @@ def apply_diarization_labels(
         ]
 
         if not filtered_overlaps:
-            updated_segments.append(seg)
+            # All overlaps are below threshold - assign largest overlap with indeterminate=True
+            if overlaps:
+                best_overlap = max(
+                    overlaps,
+                    key=lambda item: float(item["end"]) - float(item["start"]),
+                )
+                speaker_id = str(best_overlap.get("speaker_id") or "UNKNOWN")
+                updated_segments.append(
+                    TranscriptSegment(
+                        start=seg.start,
+                        end=seg.end,
+                        text=seg.text,
+                        speaker_id=speaker_id,
+                        speaker_name=_get_speaker_name(speaker_id, seg.speaker_name),
+                        confidence=seg.confidence,
+                        justification=seg.justification,
+                        indeterminate=True,
+                        metadata=dict(seg.metadata),
+                    )
+                )
+            else:
+                updated_segments.append(seg)
             continue
 
         # Check if all filtered overlaps have the same speaker
@@ -936,7 +1211,7 @@ def apply_diarization_labels(
                     end=seg.end,
                     text=seg.text,
                     speaker_id=speaker_id,
-                    speaker_name=seg.speaker_name,
+                    speaker_name=_get_speaker_name(speaker_id, seg.speaker_name),
                     confidence=seg.confidence,
                     justification=seg.justification,
                     metadata=dict(seg.metadata),
@@ -946,13 +1221,14 @@ def apply_diarization_labels(
 
         if len(filtered_overlaps) == 1:
             overlap = filtered_overlaps[0]
+            speaker_id = str(overlap.get("speaker_id") or "UNKNOWN")
             updated_segments.append(
                 TranscriptSegment(
                     start=seg.start,
                     end=seg.end,
                     text=seg.text,
-                    speaker_id=str(overlap.get("speaker_id") or "UNKNOWN"),
-                    speaker_name=seg.speaker_name,
+                    speaker_id=speaker_id,
+                    speaker_name=_get_speaker_name(speaker_id, seg.speaker_name),
                     confidence=seg.confidence,
                     justification=seg.justification,
                     metadata=dict(seg.metadata),
@@ -989,13 +1265,14 @@ def apply_diarization_labels(
                         best_overlap = overlap
             
             if best_overlap:
+                speaker_id = str(best_overlap.get("speaker_id") or "UNKNOWN")
                 updated_segments.append(
                     TranscriptSegment(
                         start=seg.start,
                         end=seg.end,
                         text=seg.text,
-                        speaker_id=str(best_overlap.get("speaker_id") or "UNKNOWN"),
-                        speaker_name=seg.speaker_name,
+                        speaker_id=speaker_id,
+                        speaker_name=_get_speaker_name(speaker_id, seg.speaker_name),
                         confidence=seg.confidence,
                         justification=seg.justification,
                         metadata=dict(seg.metadata),
@@ -1013,13 +1290,14 @@ def apply_diarization_labels(
             filtered_overlaps,
             key=lambda item: float(item["end"]) - float(item["start"]),
         )
+        speaker_id = str(best_overlap.get("speaker_id") or "UNKNOWN")
         updated_segments.append(
             TranscriptSegment(
                 start=seg.start,
                 end=seg.end,
                 text=seg.text,
-                speaker_id=str(best_overlap.get("speaker_id") or "UNKNOWN"),
-                speaker_name=seg.speaker_name,
+                speaker_id=speaker_id,
+                speaker_name=_get_speaker_name(speaker_id, seg.speaker_name),
                 confidence=seg.confidence,
                 justification=seg.justification,
                 metadata=dict(seg.metadata),
